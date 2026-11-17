@@ -1,5 +1,5 @@
-bin/
+/bin/
 *.exe
-data/
-config/
+/data/
+/config/
 .git/

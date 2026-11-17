@@ -1,6 +1,6 @@
 *.exe
-seedlink-auditor
-bin/
-data/
-config/
+/seedlink-auditor
+/bin/
+/data/
+/config/
 .DS_Store
