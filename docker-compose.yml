@@ -1,0 +1,13 @@
+services:
+  seedlink-auditor:
+    image: ghcr.io/kakmoster/seedlink-auditor:latest
+    # build: .
+    container_name: seedlink-auditor
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      - SEEDLINK_CONFIG_PATH=/config/settings.json
+    volumes:
+      - ./config:/config
+      - /path/to/your/data:/data

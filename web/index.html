@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SeedLink Auditor — Multi-Folder Hardlink &amp; Cross-Seed Manager</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Header Bar -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.1">
+            <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+            <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+          </svg>
+        </div>
+        <div>
+          <h1>SeedLink Auditor</h1>
+          <p class="brand-sub">Multi-Folder Hardlink &amp; qBittorrent Cross-Seed Auditor</p>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <button id="readOnlyToggleBtn" class="readonly-pill is-safe" type="button" title="Toggle Read-Only Protection">
+          <span class="dot"></span>
+          <span id="readOnlyLabel">SAFE READ-ONLY MODE</span>
+        </button>
+
+        <button id="openSettingsBtn" class="btn btn-secondary" type="button">
+          Settings (Folders &amp; qBit)
+        </button>
+
+        <div class="export-group">
+          <button id="exportCsvBtn" class="btn btn-ghost" type="button">Export CSV</button>
+          <button id="exportJsonBtn" class="btn btn-ghost" type="button">JSON</button>
+        </div>
+
+        <button id="scanNowBtn" class="btn btn-primary" type="button">
+          <span class="btn-spinner" id="scanSpinner" hidden></span>
+          <span id="scanBtnText">Scan Now</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="main-content">
+      <!-- Status & Warnings -->
+      <section id="alertStack" class="alert-stack" hidden></section>
+
+      <!-- Configured Targets Strip -->
+      <section class="targets-strip" id="targetsStrip">
+        <div class="strip-group">
+          <span class="strip-label">Folders:</span>
+          <div id="folderChips" class="chip-list">
+            <span class="chip chip-muted">No folders configured</span>
+          </div>
+        </div>
+        <div class="strip-group">
+          <span class="strip-label">qBittorrent:</span>
+          <div id="qbitChips" class="chip-list">
+            <span class="chip chip-muted">No instances configured</span>
+          </div>
+        </div>
+        <div class="strip-meta" id="scanMeta">Not scanned yet</div>
+      </section>
+
+      <!-- Welcome Card (shown when unconfigured or before first scan) -->
+      <section id="welcomeCard" class="welcome-card">
+        <div class="welcome-body">
+          <h2>Find orphaned cross-seeds &amp; duplicate files wasting disk space</h2>
+          <p>
+            Compare two or more folders (including subfolders) by physical inode / file index and link count
+            and cross-reference every file against one or more qBittorrent instances. Spot cross-seeds whose original
+            file was deleted, convert duplicate copies into zero-space hardlinks, or clean up untracked leftovers.
+          </p>
+          <div class="welcome-actions">
+            <button id="welcomeSettingsBtn" class="btn btn-primary" type="button">Configure Folders &amp; qBittorrent</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Summary KPI Cards -->
+      <section class="kpi-grid" id="kpiGrid">
+        <button class="kpi-card kpi-danger" data-filter-tab="ORPHANED_IN_B" type="button">
+          <div class="kpi-top">
+            <span class="kpi-title">Orphaned Cross-Seeds</span>
+            <span class="kpi-tag">Original Removed</span>
+          </div>
+          <div class="kpi-value" id="kpiOrphanedBytes">0 B</div>
+          <div class="kpi-sub"><span id="kpiOrphanedCount">0</span> files only in Folder B+ (reclaimable space)</div>
+        </button>
+
+        <button class="kpi-card kpi-amber" data-filter-tab="DUPLICATE_COPY" type="button">
+          <div class="kpi-top">
+            <span class="kpi-title">Duplicate Copies</span>
+            <span class="kpi-tag">Not Hardlinked</span>
+          </div>
+          <div class="kpi-value" id="kpiDuplicateBytes">0 B</div>
+          <div class="kpi-sub"><span id="kpiDuplicateCount">0</span> file groups convertible to hardlinks</div>
+        </button>
+
+        <button class="kpi-card kpi-green" data-filter-tab="HARDLINKED" type="button">
+          <div class="kpi-top">
+            <span class="kpi-title">Healthy Hardlinks</span>
+            <span class="kpi-tag">Space Saved</span>
+          </div>
+          <div class="kpi-value" id="kpiHardlinkBytes">0 B</div>
+          <div class="kpi-sub"><span id="kpiHardlinkCount">0</span> shared inode groups across folders</div>
+        </button>
+
+        <button class="kpi-card kpi-slate" data-filter-tab="UNTRACKED" type="button">
+          <div class="kpi-top">
+            <span class="kpi-title">Untracked Disk Files</span>
+            <span class="kpi-tag">Not in qBit</span>
+          </div>
+          <div class="kpi-value" id="kpiUntrackedBytes">0 B</div>
+          <div class="kpi-sub"><span id="kpiUntrackedCount">0</span> file groups absent from qBittorrent</div>
+        </button>
+      </section>
+
+      <!-- Filter & Bulk Action Toolbar -->
+      <section class="toolbar-panel">
+        <div class="tabs-row" id="quickTabs">
+          <button class="tab-btn active" data-tab="ALL" type="button">All <span class="tab-count" id="tabCountAll">0</span></button>
+          <button class="tab-btn" data-tab="ORPHANED_IN_B" type="button">Orphaned Cross-Seeds <span class="tab-count" id="tabCountOrphaned">0</span></button>
+          <button class="tab-btn" data-tab="DUPLICATE_COPY" type="button">Duplicate Copies <span class="tab-count" id="tabCountDup">0</span></button>
+          <button class="tab-btn" data-tab="HARDLINKED" type="button">Healthy Hardlinks <span class="tab-count" id="tabCountHardlink">0</span></button>
+          <button class="tab-btn" data-tab="UNTRACKED" type="button">Untracked in qBit <span class="tab-count" id="tabCountUntracked">0</span></button>
+          <button class="tab-btn" data-tab="ONLY_IN_A" type="button">Only in Folder A <span class="tab-count" id="tabCountOnlyA">0</span></button>
+        </div>
+
+        <div class="controls-row">
+          <div class="filters-left">
+            <input
+              id="searchInput"
+              class="input-control search-input"
+              type="search"
+              placeholder="Search filename, subfolder, torrent, or tracker..."
+            />
+            <select id="seedingFilter" class="input-control">
+              <option value="ALL">All qBit States</option>
+              <option value="SEEDING">Seeding</option>
+              <option value="PAUSED">Paused</option>
+              <option value="DOWNLOADING">Downloading</option>
+              <option value="UNTRACKED">Not in qBit</option>
+            </select>
+            <select id="folderFilter" class="input-control">
+              <option value="ALL">All Folders</option>
+            </select>
+          </div>
+
+          <div class="bulk-actions">
+            <span class="selection-badge" id="selectionBadge">0 selected</span>
+            <button id="bulkDeleteTorrentsBtn" class="btn btn-danger btn-sm" type="button" disabled>
+              Delete Torrents + Data in qBit
+            </button>
+            <button id="bulkHardlinkBtn" class="btn btn-amber btn-sm" type="button" disabled>
+              Convert Copies &rarr; Hardlinks
+            </button>
+            <button id="bulkDeleteFilesBtn" class="btn btn-outline-danger btn-sm" type="button" disabled>
+              Delete Files from Disk
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Comparison Table -->
+      <section class="table-card">
+        <div class="table-wrap">
+          <table class="audit-table">
+            <thead>
+              <tr>
+                <th class="col-check">
+                  <input type="checkbox" id="selectAllCheckbox" aria-label="Select all visible rows" />
+                </th>
+                <th class="col-file">File &amp; Size</th>
+                <th class="col-folders">Folder Presence &amp; Inode Status</th>
+                <th class="col-qbit">qBittorrent Status</th>
+                <th class="col-reclaim">Reclaimable</th>
+                <th class="col-actions">Quick Actions</th>
+              </tr>
+            </thead>
+            <tbody id="auditTableBody">
+              <tr>
+                <td colspan="6" class="empty-table-cell">
+                  No scan data yet. Open <strong>Settings (Folders &amp; qBit)</strong> to add your folders and click <strong>Scan Now</strong>.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Settings Modal -->
+  <div id="settingsModal" class="modal-backdrop" hidden>
+    <div class="modal modal-lg" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle">
+      <div class="modal-header">
+        <h2 id="settingsModalTitle">Configuration — Folders &amp; qBittorrent Instances</h2>
+        <button class="modal-close" id="closeSettingsBtn" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="settings-section">
+          <div class="section-head">
+            <div>
+              <h3>Folders to Compare</h3>
+              <p class="section-hint">
+                Set your original downloads/media folder as <strong>Primary (Folder A)</strong> and cross-seed folder(s) as <strong>Secondary (Folder B+)</strong>.
+                In Docker, mount a single shared parent directory (e.g. <code>/path/to/data:/data</code>) so hardlinks share the same filesystem.
+              </p>
+            </div>
+            <button id="addFolderBtn" class="btn btn-secondary btn-sm" type="button">+ Add Folder</button>
+          </div>
+          <div id="foldersEditorList" class="editor-list"></div>
+        </div>
+
+        <div class="settings-section">
+          <div class="section-head">
+            <div>
+              <h3>qBittorrent Instances</h3>
+              <p class="section-hint">
+                Connect one or more qBittorrent WebUI endpoints. Use Path Mappings if qBittorrent reports container paths (e.g. <code>/downloads</code>) that differ from SeedLink's local path (e.g. <code>/data/torrents</code>).
+              </p>
+            </div>
+            <button id="addQbitBtn" class="btn btn-secondary btn-sm" type="button">+ Add qBit Instance</button>
+          </div>
+          <div id="qbitEditorList" class="editor-list"></div>
+        </div>
+
+        <div class="settings-section">
+          <div class="section-head">
+            <div>
+              <h3>Scan Filters</h3>
+              <p class="section-hint">Optionally ignore small metadata files or extensions across all folders.</p>
+            </div>
+          </div>
+          <div class="filter-inputs-grid">
+            <label class="field-group">
+              <span>Ignore Extensions (comma-separated)</span>
+              <input id="ignoreExtInput" class="input-control" type="text" placeholder=".nfo, .srt, .jpg, .txt" />
+            </label>
+            <label class="field-group">
+              <span>Minimum File Size (bytes)</span>
+              <input id="minSizeInput" class="input-control" type="number" min="0" step="1024" placeholder="0" />
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="cancelSettingsBtn" class="btn btn-ghost" type="button">Cancel</button>
+        <button id="saveSettingsBtn" class="btn btn-primary" type="button">Save &amp; Run Scan</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Visual Folder Browser Modal -->
+  <div id="folderPickerModal" class="modal-backdrop" hidden>
+    <div class="modal modal-md" role="dialog" aria-modal="true" aria-labelledby="folderPickerTitle">
+      <div class="modal-header">
+        <h2 id="folderPickerTitle">Select Directory</h2>
+        <button class="modal-close" id="closePickerBtn" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="picker-nav">
+          <button id="pickerUpBtn" class="btn btn-secondary btn-sm" type="button">&uarr; Up</button>
+          <input id="pickerCurrentPath" class="input-control" type="text" readonly />
+        </div>
+        <div id="pickerList" class="picker-list"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="cancelPickerBtn" class="btn btn-ghost" type="button">Cancel</button>
+        <button id="selectPickerBtn" class="btn btn-primary" type="button">Use This Folder</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Action Preview & Confirmation Modal -->
+  <div id="actionModal" class="modal-backdrop" hidden>
+    <div class="modal modal-md" role="dialog" aria-modal="true" aria-labelledby="actionModalTitle">
+      <div class="modal-header">
+        <h2 id="actionModalTitle">Confirm Action (Dry-Run Preview)</h2>
+        <button class="modal-close" id="closeActionBtn" type="button" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="actionReadOnlyBanner" class="alert alert-warning" hidden>
+          <strong>Safe Read-Only Mode is Active.</strong> This preview shows what would happen. Disable Read-Only Mode in the header (or click "Unlock &amp; Execute" below) to apply changes.
+        </div>
+
+        <div id="torrentDeleteOptionRow" class="checkbox-row" hidden>
+          <label>
+            <input type="checkbox" id="deleteTorrentFilesCheckbox" checked />
+            <span>Also delete torrent data files from disk (recommended to reclaim space)</span>
+          </label>
+        </div>
+
+        <div class="preview-summary" id="actionPreviewSummary">Calculating preview...</div>
+        <div class="preview-list" id="actionPreviewList"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="cancelActionBtn" class="btn btn-ghost" type="button">Cancel</button>
+        <button id="unlockAndExecuteBtn" class="btn btn-amber" type="button" hidden>Unlock Read-Only &amp; Execute</button>
+        <button id="confirmActionBtn" class="btn btn-danger" type="button">Confirm &amp; Execute</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
