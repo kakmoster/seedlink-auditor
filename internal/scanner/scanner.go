@@ -58,6 +58,8 @@ type TorrentMatch struct {
 	Ratio         float64  `json:"ratio"`
 	Tracker       string   `json:"tracker"`
 	TrackerHost   string   `json:"tracker_host"`
+	TrackerHealth string   `json:"tracker_health"`
+	TrackerMsg    string   `json:"tracker_msg"`
 	SavePath      string   `json:"save_path"`
 	RelativeName  string   `json:"relative_name"`
 	MappedPath    string   `json:"mapped_path"`
@@ -75,6 +77,8 @@ type ComparisonGroup struct {
 	Size                  int64          `json:"size"`
 	Status                string         `json:"status"`
 	SeedingSummary        string         `json:"seeding_summary"`
+	HasTrackerIssue       bool           `json:"has_tracker_issue"`
+	HasUnregistered       bool           `json:"has_unregistered"`
 	SoleCopyOnDisk        bool           `json:"sole_copy_on_disk"`
 	ExternalHardlinkCount int            `json:"external_hardlink_count"`
 	CanHardlink           bool           `json:"can_hardlink"`
@@ -105,6 +109,8 @@ type Summary struct {
 	UntrackedCount                int   `json:"untracked_count"`
 	UntrackedBytes                int64 `json:"untracked_bytes"`
 	SeedingCount                  int   `json:"seeding_count"`
+	UnregisteredCount             int   `json:"unregistered_count"`
+	TrackerErrorCount             int   `json:"tracker_error_count"`
 	TotalReclaimableBytes         int64 `json:"total_reclaimable_bytes"`
 }
 
@@ -722,6 +728,8 @@ func ScanAndCompare(settings config.AppSettings, qbitIndex *qbit.Index) ScanResu
 						Ratio:         m.Entry.Ratio,
 						Tracker:       m.Entry.Tracker,
 						TrackerHost:   m.Entry.TrackerHost,
+						TrackerHealth: m.Entry.TrackerHealth,
+						TrackerMsg:    m.Entry.TrackerMsg,
 						SavePath:      m.Entry.SavePath,
 						RelativeName:  m.Entry.RelativeName,
 						MappedPath:    m.Entry.MappedPath,
@@ -748,10 +756,17 @@ func ScanAndCompare(settings config.AppSettings, qbitIndex *qbit.Index) ScanResu
 
 		torrents := make([]TorrentMatch, 0, len(matchedOrder))
 		anySeeding := false
+		anyUnregistered := false
+		anyError := false
 		anyDownloading := false
 		for _, tk := range matchedOrder {
 			tm := *matchedMap[tk]
 			torrents = append(torrents, tm)
+			if tm.TrackerHealth == "UNREGISTERED" {
+				anyUnregistered = true
+			} else if tm.TrackerHealth == "TRACKER_ERROR" || tm.TrackerHealth == "LOCAL_ERROR" {
+				anyError = true
+			}
 			if tm.IsSeeding {
 				anySeeding = true
 			} else if tm.SeedingStatus == "downloading" {
@@ -759,8 +774,20 @@ func ScanAndCompare(settings config.AppSettings, qbitIndex *qbit.Index) ScanResu
 			}
 		}
 
+		hasTrackerIssue := anyUnregistered || anyError
+		if anyUnregistered {
+			summary.UnregisteredCount++
+		}
+		if hasTrackerIssue {
+			summary.TrackerErrorCount++
+		}
+
 		var seedingSummary string
 		switch {
+		case anyUnregistered && !anySeeding:
+			seedingSummary = "UNREGISTERED"
+		case anyError && !anySeeding:
+			seedingSummary = "ERROR"
 		case anySeeding:
 			seedingSummary = "SEEDING"
 			summary.SeedingCount++
@@ -804,6 +831,8 @@ func ScanAndCompare(settings config.AppSettings, qbitIndex *qbit.Index) ScanResu
 			Size:                  displaySize,
 			Status:                status,
 			SeedingSummary:        seedingSummary,
+			HasTrackerIssue:       hasTrackerIssue,
+			HasUnregistered:       anyUnregistered,
 			SoleCopyOnDisk:        soleCopyOnDisk,
 			ExternalHardlinkCount: externalHardlinkCount,
 			CanHardlink:           canHardlink,

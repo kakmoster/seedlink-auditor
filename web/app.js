@@ -197,6 +197,7 @@
     $("tabCountDup").textContent = String(s.duplicate_copy_count);
     $("tabCountHardlink").textContent = String(s.hardlinked_count);
     $("tabCountUntracked").textContent = String(s.untracked_count);
+    $("tabCountTrackerIssue").textContent = String(s.tracker_error_count || 0);
     $("tabCountOnlyA").textContent = String(s.only_in_a_count);
   }
 
@@ -205,13 +206,19 @@
     const q = state.search.trim().toLowerCase();
 
     return state.scan.groups.filter((grp) => {
-      if (state.activeTab === "UNTRACKED") {
+      if (state.activeTab === "TRACKER_ISSUE") {
+        if (!grp.has_tracker_issue) return false;
+      } else if (state.activeTab === "UNTRACKED") {
         if (grp.seeding_summary !== "UNTRACKED") return false;
       } else if (state.activeTab !== "ALL") {
         if (grp.status !== state.activeTab) return false;
       }
 
-      if (state.seedingFilter !== "ALL" && grp.seeding_summary !== state.seedingFilter) {
+      if (state.seedingFilter === "UNREGISTERED") {
+        if (!grp.has_unregistered && grp.seeding_summary !== "UNREGISTERED") return false;
+      } else if (state.seedingFilter === "ERROR") {
+        if (!grp.has_tracker_issue && grp.seeding_summary !== "ERROR") return false;
+      } else if (state.seedingFilter !== "ALL" && grp.seeding_summary !== state.seedingFilter) {
         return false;
       }
 
@@ -225,7 +232,9 @@
           grp.filename,
           grp.rel_path,
           ...grp.all_paths,
-          ...grp.torrents.map((t) => `${t.torrent_name} ${t.tracker_host} ${t.instance_name}`),
+          ...grp.torrents.map(
+            (t) => `${t.torrent_name} ${t.tracker_host} ${t.instance_name} ${t.tracker_health || ""} ${t.tracker_msg || ""}`
+          ),
         ]
           .join(" ")
           .toLowerCase();
@@ -255,17 +264,47 @@
     }
   }
 
-  function renderSeedingBadge(seedingSummary) {
-    switch (seedingSummary) {
-      case "SEEDING":
-        return `<span class="status-pill pill-seeding">SEEDING</span>`;
-      case "PAUSED":
-        return `<span class="status-pill pill-paused">PAUSED</span>`;
-      case "DOWNLOADING":
-        return `<span class="status-pill pill-downloading">DOWNLOADING</span>`;
+  function trackerHealthLabel(health) {
+    switch (health) {
+      case "UNREGISTERED":
+        return "UNREGISTERED";
+      case "LOCAL_ERROR":
+        return "LOCAL ERROR";
+      case "TRACKER_ERROR":
+        return "TRACKER ERROR";
       default:
-        return `<span class="status-pill pill-untracked">UNTRACKED</span>`;
+        return health || "";
     }
+  }
+
+  function renderSeedingBadge(grp) {
+    let primary = "";
+    switch (grp.seeding_summary) {
+      case "SEEDING":
+        primary = `<span class="status-pill pill-seeding">SEEDING</span>`;
+        break;
+      case "UNREGISTERED":
+        primary = `<span class="status-pill pill-error">UNREGISTERED</span>`;
+        break;
+      case "ERROR":
+        primary = `<span class="status-pill pill-error">TRACKER ERROR</span>`;
+        break;
+      case "PAUSED":
+        primary = `<span class="status-pill pill-paused">PAUSED</span>`;
+        break;
+      case "DOWNLOADING":
+        primary = `<span class="status-pill pill-downloading">DOWNLOADING</span>`;
+        break;
+      default:
+        primary = `<span class="status-pill pill-untracked">UNTRACKED</span>`;
+        break;
+    }
+
+    if (grp.has_tracker_issue && grp.seeding_summary !== "UNREGISTERED" && grp.seeding_summary !== "ERROR") {
+      const issueLabel = grp.has_unregistered ? "HAS UNREGISTERED" : "HAS TRACKER ERROR";
+      return `${primary} <span class="status-pill pill-error">${issueLabel}</span>`;
+    }
+    return primary;
   }
 
   function renderFolderFileBox(file, badgeLabel) {
@@ -316,18 +355,27 @@
           grp.torrents.length === 0
             ? `<div class="torrent-sub">Not matched in any configured qBittorrent instance</div>`
             : grp.torrents
-                .map(
-                  (t) => `
-                <div class="torrent-item">
+                .map((t) => {
+                  const hasHealthIssue = Boolean(t.tracker_health);
+                  const healthBadge = hasHealthIssue
+                    ? `<span class="status-pill pill-error pill-inline">${escapeHtml(trackerHealthLabel(t.tracker_health))}</span>`
+                    : "";
+                  const msgHtml = t.tracker_msg
+                    ? `<div class="tracker-error-msg">${escapeHtml(t.tracker_msg)}</div>`
+                    : "";
+                  return `
+                <div class="torrent-item ${hasHealthIssue ? "has-error" : ""}">
                   <div class="torrent-top">
                     <span class="instance-badge">${escapeHtml(t.instance_name)}</span>
                     ${t.tracker_host ? `<span class="tracker-badge">${escapeHtml(t.tracker_host)}</span>` : ""}
                     <span class="nlink-badge">${escapeHtml(t.state)}</span>
+                    ${healthBadge}
                   </div>
                   <div class="torrent-name">${escapeHtml(t.torrent_name)}</div>
+                  ${msgHtml}
                   <div class="torrent-sub">Ratio: ${Number(t.ratio || 0).toFixed(2)} • Match: ${escapeHtml(t.match_type)}</div>
-                </div>`
-                )
+                </div>`;
+                })
                 .join("");
 
         const reclaimClass =
@@ -338,6 +386,13 @@
             : "reclaim-zero";
 
         const actionBtns = [];
+        const erroredTorrents = grp.torrents.filter((t) => Boolean(t.tracker_health));
+        if (erroredTorrents.length > 0) {
+          const errBtnText = grp.has_unregistered ? "Delete Unregistered" : "Delete Errored";
+          actionBtns.push(
+            `<button class="btn btn-outline-danger btn-xs row-delete-errored-torrent" data-group-id="${escapeHtml(grp.id)}" type="button">${errBtnText}</button>`
+          );
+        }
         if (grp.torrents.length > 0) {
           actionBtns.push(
             `<button class="btn btn-danger btn-xs row-delete-torrent" data-group-id="${escapeHtml(grp.id)}" type="button">Delete Torrent</button>`
@@ -371,7 +426,7 @@
               ${folderHtml}
             </td>
             <td class="col-qbit">
-              ${renderSeedingBadge(grp.seeding_summary)}
+              ${renderSeedingBadge(grp)}
               ${torrentsHtml}
             </td>
             <td class="col-reclaim">
@@ -948,7 +1003,11 @@
       const grp = state.scan.groups.find((g) => g.id === gid);
       if (!grp) return;
 
-      if (btn.classList.contains("row-delete-torrent")) {
+      if (btn.classList.contains("row-delete-errored-torrent")) {
+        openActionModal("delete-torrents", [
+          { ...grp, torrents: grp.torrents.filter((t) => Boolean(t.tracker_health)) },
+        ]);
+      } else if (btn.classList.contains("row-delete-torrent")) {
         openActionModal("delete-torrents", [grp]);
       } else if (btn.classList.contains("row-hardlink")) {
         openActionModal("convert-hardlinks", [grp]);

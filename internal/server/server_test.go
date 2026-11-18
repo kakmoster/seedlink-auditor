@@ -22,6 +22,12 @@ import (
 	"seedlink-auditor/internal/server"
 )
 
+type mockTracker struct {
+	URL    string `json:"url"`
+	Status int    `json:"status"`
+	Msg    string `json:"msg"`
+}
+
 type mockTorrent struct {
 	Hash     string
 	Name     string
@@ -29,6 +35,7 @@ type mockTorrent struct {
 	State    string
 	Ratio    float64
 	Tracker  string
+	Trackers []mockTracker
 	Files    []struct {
 		Name string `json:"name"`
 		Size int64  `json:"size"`
@@ -36,10 +43,11 @@ type mockTorrent struct {
 }
 
 type mockQbitServer struct {
-	mu       sync.Mutex
-	torrents map[string]mockTorrent
-	server   *httptest.Server
-	localMap map[string]string // remote prefix -> local root for optional deleteFiles simulation
+	mu                     sync.Mutex
+	torrents               map[string]mockTorrent
+	server                 *httptest.Server
+	localMap               map[string]string // remote prefix -> local root for optional deleteFiles simulation
+	omitInlineTrackers     bool
 }
 
 func newMockQbitServer(t *testing.T, initial []mockTorrent) *mockQbitServer {
@@ -83,20 +91,44 @@ func newMockQbitServer(t *testing.T, initial []mockTorrent) *mockQbitServer {
 		if !requireAuth(w, r) {
 			return
 		}
+		includeTrackers := r.URL.Query().Get("includeTrackers") == "true"
 		mq.mu.Lock()
 		defer mq.mu.Unlock()
 		list := make([]map[string]any, 0, len(mq.torrents))
 		for _, mt := range mq.torrents {
-			list = append(list, map[string]any{
+			row := map[string]any{
 				"hash":      mt.Hash,
 				"name":      mt.Name,
 				"save_path": mt.SavePath,
 				"state":     mt.State,
 				"ratio":     mt.Ratio,
 				"tracker":   mt.Tracker,
-			})
+			}
+			if includeTrackers && !mq.omitInlineTrackers && len(mt.Trackers) > 0 {
+				row["trackers"] = mt.Trackers
+			}
+			list = append(list, row)
 		}
 		_ = json.NewEncoder(w).Encode(list)
+	})
+
+	mux.HandleFunc("/api/v2/torrents/trackers", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAuth(w, r) {
+			return
+		}
+		h := r.URL.Query().Get("hash")
+		mq.mu.Lock()
+		mt, ok := mq.torrents[h]
+		mq.mu.Unlock()
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		if mt.Trackers == nil {
+			_ = json.NewEncoder(w).Encode([]mockTracker{})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(mt.Trackers)
 	})
 
 	mux.HandleFunc("/api/v2/torrents/files", func(w http.ResponseWriter, r *http.Request) {
@@ -272,6 +304,7 @@ func setupFixture(t *testing.T) fixtureEnv {
 			State:    "uploading",
 			Ratio:    2.5,
 			Tracker:  "https://alpha.tracker.org/announce",
+			Trackers: []mockTracker{{URL: "https://alpha.tracker.org/announce", Status: 2, Msg: ""}},
 			Files: []struct {
 				Name string `json:"name"`
 				Size int64  `json:"size"`
@@ -284,6 +317,7 @@ func setupFixture(t *testing.T) fixtureEnv {
 			State:    "stalledUP",
 			Ratio:    1.2,
 			Tracker:  "https://alpha.tracker.org/announce",
+			Trackers: []mockTracker{{URL: "https://alpha.tracker.org/announce", Status: 2, Msg: ""}},
 			Files: []struct {
 				Name string `json:"name"`
 				Size int64  `json:"size"`
@@ -300,6 +334,7 @@ func setupFixture(t *testing.T) fixtureEnv {
 			State:    "stalledUP",
 			Ratio:    0.9,
 			Tracker:  "https://beta.tracker.org/announce",
+			Trackers: []mockTracker{{URL: "https://beta.tracker.org/announce", Status: 4, Msg: "Torrent not registered with this tracker"}},
 			Files: []struct {
 				Name string `json:"name"`
 				Size int64  `json:"size"`
@@ -312,6 +347,7 @@ func setupFixture(t *testing.T) fixtureEnv {
 			State:    "uploading",
 			Ratio:    3.1,
 			Tracker:  "https://beta.tracker.org/announce",
+			Trackers: []mockTracker{{URL: "https://beta.tracker.org/announce", Status: 2, Msg: ""}},
 			Files: []struct {
 				Name string `json:"name"`
 				Size int64  `json:"size"`
@@ -406,11 +442,117 @@ func TestScanCorrelationAndDisambiguation(t *testing.T) {
 	if dune == nil || dune.Status != "HARDLINKED" || dune.SeedingSummary != "SEEDING" || len(dune.Torrents) != 2 {
 		t.Fatalf("unexpected Dune group state: %+v", dune)
 	}
+	if !dune.HasUnregistered || !dune.HasTrackerIssue {
+		t.Fatalf("expected Dune group to flag unregistered cross-seed tracker, got %+v", dune)
+	}
+	if scan.Summary.UnregisteredCount != 1 || scan.Summary.TrackerErrorCount != 1 {
+		t.Fatalf("expected UnregisteredCount=1 TrackerErrorCount=1, got %d / %d", scan.Summary.UnregisteredCount, scan.Summary.TrackerErrorCount)
+	}
+	var xsDune *scanner.TorrentMatch
+	for i := range dune.Torrents {
+		if dune.Torrents[i].TorrentHash == "h_x_dune" {
+			xsDune = &dune.Torrents[i]
+		}
+	}
+	if xsDune == nil || xsDune.TrackerHealth != "UNREGISTERED" || xsDune.TrackerMsg != "Torrent not registered with this tracker" {
+		t.Fatalf("expected unregistered tracker details on h_x_dune, got %+v", xsDune)
+	}
 	if andor == nil || andor.Status != "ORPHANED_IN_B" || !andor.SoleCopyOnDisk || andor.SeedingSummary != "SEEDING" {
 		t.Fatalf("unexpected Andor group state: %+v", andor)
 	}
 	if dup == nil || dup.Status != "DUPLICATE_COPY" || !dup.CanHardlink || len(dup.HardlinkPairs) != 1 {
 		t.Fatalf("unexpected Interstellar duplicate group state: %+v", dup)
+	}
+}
+
+func TestTrackerErrorAndFallbackEndpoint(t *testing.T) {
+	root := t.TempDir()
+	folderA := filepath.Join(root, "folder_a")
+	folderB := filepath.Join(root, "folder_b")
+	writeTestFile(t, filepath.Join(folderB, "unreg.mkv"), makePayload("unreg", 32*1024))
+	writeTestFile(t, filepath.Join(folderB, "passkey.mkv"), makePayload("passkey", 32*1024))
+	writeTestFile(t, filepath.Join(folderA, "localerr.mkv"), makePayload("localerr", 32*1024))
+
+	mq := newMockQbitServer(t, []mockTorrent{
+		{
+			Hash:     "h1",
+			Name:     "unreg",
+			SavePath: qbit.NormalizeSlashPath(folderB),
+			State:    "stalledUP",
+			Tracker:  "https://t.example/announce",
+			Trackers: []mockTracker{{URL: "https://t.example/announce", Status: 4, Msg: "Unregistered torrent"}},
+			Files: []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+			}{{Name: "unreg.mkv", Size: 32 * 1024}},
+		},
+		{
+			Hash:     "h2",
+			Name:     "passkey",
+			SavePath: qbit.NormalizeSlashPath(folderB),
+			State:    "stalledUP",
+			Tracker:  "https://t.example/announce",
+			Trackers: []mockTracker{{URL: "https://t.example/announce", Status: 4, Msg: "Passkey does not exist"}},
+			Files: []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+			}{{Name: "passkey.mkv", Size: 32 * 1024}},
+		},
+		{
+			Hash:     "h3",
+			Name:     "localerr",
+			SavePath: qbit.NormalizeSlashPath(folderA),
+			State:    "missingFiles",
+			Tracker:  "https://t.example/announce",
+			Files: []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+			}{{Name: "localerr.mkv", Size: 32 * 1024}},
+		},
+	})
+	mq.omitInlineTrackers = true // force fallback to /api/v2/torrents/trackers
+
+	cfgMgr, err := config.NewManager(filepath.Join(root, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cfgMgr.Update(config.AppSettings{
+		ReadOnlyMode: true,
+		Folders: []config.FolderConfig{
+			{ID: "fa", Label: "A", Path: folderA, Role: "primary"},
+			{ID: "fb", Label: "B", Path: folderB, Role: "secondary"},
+		},
+		QbitInstances: []config.QbitInstanceConfig{
+			{ID: "q1", Name: "q1", URL: mq.server.URL, Username: "admin", Password: "secret", Enabled: true},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(server.New(cfgMgr, qbit.NewClient(5*time.Second), nil))
+	t.Cleanup(ts.Close)
+
+	var scan scanner.ScanResult
+	if code := apiDoJSON(t, ts, http.MethodPost, "/api/scan", nil, &scan); code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/scan, got %d", code)
+	}
+	if scan.Summary.UnregisteredCount != 1 || scan.Summary.TrackerErrorCount != 3 {
+		t.Fatalf("expected UnregisteredCount=1 TrackerErrorCount=3, got %d / %d", scan.Summary.UnregisteredCount, scan.Summary.TrackerErrorCount)
+	}
+
+	byName := make(map[string]scanner.ComparisonGroup)
+	for _, g := range scan.Groups {
+		byName[g.Filename] = g
+	}
+	if byName["unreg.mkv"].SeedingSummary != "UNREGISTERED" || byName["unreg.mkv"].Torrents[0].TrackerHealth != "UNREGISTERED" {
+		t.Fatalf("unexpected unreg.mkv state: %+v", byName["unreg.mkv"])
+	}
+	if byName["passkey.mkv"].SeedingSummary != "ERROR" || byName["passkey.mkv"].Torrents[0].TrackerHealth != "TRACKER_ERROR" {
+		t.Fatalf("expected passkey message to be TRACKER_ERROR (not UNREGISTERED), got %+v", byName["passkey.mkv"])
+	}
+	if byName["localerr.mkv"].SeedingSummary != "ERROR" || byName["localerr.mkv"].Torrents[0].TrackerHealth != "LOCAL_ERROR" {
+		t.Fatalf("expected missingFiles torrent to be LOCAL_ERROR, got %+v", byName["localerr.mkv"])
 	}
 }
 

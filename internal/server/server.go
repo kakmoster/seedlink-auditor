@@ -383,7 +383,15 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		torrents := make([]string, 0, len(grp.Torrents))
 		trackerSet := make(map[string]struct{})
 		for _, t := range grp.Torrents {
-			torrents = append(torrents, fmt.Sprintf("%s: %s [%s]", t.InstanceName, t.TorrentName, t.State))
+			desc := fmt.Sprintf("%s: %s [%s]", t.InstanceName, t.TorrentName, t.State)
+			if t.TrackerHealth != "" {
+				if t.TrackerMsg != "" {
+					desc = fmt.Sprintf("%s: %s [%s | %s: %s]", t.InstanceName, t.TorrentName, t.State, t.TrackerHealth, t.TrackerMsg)
+				} else {
+					desc = fmt.Sprintf("%s: %s [%s | %s]", t.InstanceName, t.TorrentName, t.State, t.TrackerHealth)
+				}
+			}
+			torrents = append(torrents, desc)
 			if t.TrackerHost != "" {
 				trackerSet[t.TrackerHost] = struct{}{}
 			}

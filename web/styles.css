@@ -749,6 +749,18 @@ code {
   color: #94a3b8;
 }
 
+.pill-error {
+  background: var(--red-soft);
+  color: #f87171;
+  border: 1px solid rgba(239, 68, 68, 0.45);
+}
+
+.pill-inline {
+  margin-bottom: 0;
+  padding: 1px 6px;
+  font-size: 0.68rem;
+}
+
 .folder-entry {
   font-size: 0.78rem;
   padding: 5px 8px;
@@ -807,6 +819,18 @@ code {
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid var(--border);
   margin-top: 4px;
+}
+
+.torrent-item.has-error {
+  border-color: rgba(239, 68, 68, 0.45);
+  background: rgba(239, 68, 68, 0.06);
+}
+
+.tracker-error-msg {
+  margin-top: 4px;
+  font-size: 0.74rem;
+  color: #fca5a5;
+  word-break: break-word;
 }
 
 .torrent-top {

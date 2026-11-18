@@ -129,6 +129,7 @@
           <button class="tab-btn" data-tab="DUPLICATE_COPY" type="button">Duplicate Copies <span class="tab-count" id="tabCountDup">0</span></button>
           <button class="tab-btn" data-tab="HARDLINKED" type="button">Healthy Hardlinks <span class="tab-count" id="tabCountHardlink">0</span></button>
           <button class="tab-btn" data-tab="UNTRACKED" type="button">Untracked in qBit <span class="tab-count" id="tabCountUntracked">0</span></button>
+          <button class="tab-btn" data-tab="TRACKER_ISSUE" type="button">Unregistered / Errors <span class="tab-count" id="tabCountTrackerIssue">0</span></button>
           <button class="tab-btn" data-tab="ONLY_IN_A" type="button">Only in Folder A <span class="tab-count" id="tabCountOnlyA">0</span></button>
         </div>
 
@@ -143,6 +144,8 @@
             <select id="seedingFilter" class="input-control">
               <option value="ALL">All qBit States</option>
               <option value="SEEDING">Seeding</option>
+              <option value="UNREGISTERED">Unregistered</option>
+              <option value="ERROR">Tracker / Local Error</option>
               <option value="PAUSED">Paused</option>
               <option value="DOWNLOADING">Downloading</option>
               <option value="UNTRACKED">Not in qBit</option>

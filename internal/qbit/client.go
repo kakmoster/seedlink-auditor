@@ -11,6 +11,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"path"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -54,6 +55,8 @@ type TorrentFileEntry struct {
 	Ratio         float64 `json:"ratio"`
 	Tracker       string  `json:"tracker"`
 	TrackerHost   string  `json:"tracker_host"`
+	TrackerHealth string  `json:"tracker_health"`
+	TrackerMsg    string  `json:"tracker_msg"`
 	SavePath      string  `json:"save_path"`
 	RelativeName  string  `json:"relative_name"`
 	MappedPath    string  `json:"mapped_path"`
@@ -192,7 +195,136 @@ func ApplyPathMappings(pathStr string, mappings []config.PathMapping) string {
 	return norm
 }
 
-func ClassifyTorrentState(state string) (bool, string) {
+var (
+	urlStripPattern      = regexp.MustCompile(`(?i)https?://\S+`)
+	unregisteredPhrases = []string{
+		"unregistered",
+		"not registered",
+		"torrent not found",
+		"infohash not found",
+		"torrent does not exist",
+		"not exist",
+		"torrent has been deleted",
+		"torrent has been nuked",
+		"torrent has been rejected",
+		"torrent is not authorized",
+		"torrent is not found",
+		"nuked",
+		"trump",
+		"dupe",
+		"complete season uploaded",
+		"season pack",
+		"pack is available",
+		"packs are available",
+		"repack available",
+		"internal available",
+		"grab internal",
+		"dead",
+		"upgraded",
+		"uploaded",
+		"retitled",
+		"specifically banned",
+		"problem with",
+		"other:",
+		"unknown",
+		"tidak terdaftar",
+		"nicht registriert",
+		"nicht gefunden",
+		"existiert nicht",
+		"introuvable",
+		"não registrado",
+		"nem található",
+	}
+	authErrorPhrases = []string{
+		"passkey",
+		"torrent pass",
+		"user does not exist",
+	}
+)
+
+func MatchesUnregisteredMessage(msg string) bool {
+	text := strings.ToLower(strings.TrimSpace(msg))
+	if text == "" {
+		return false
+	}
+	text = strings.ReplaceAll(text, "(unknown http error)", "")
+
+	matched := false
+	for _, phrase := range unregisteredPhrases {
+		if strings.Contains(text, phrase) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return false
+	}
+
+	authText := text
+	if strings.Contains(authText, "://") {
+		authText = urlStripPattern.ReplaceAllString(authText, "")
+	}
+	for _, phrase := range authErrorPhrases {
+		if strings.Contains(authText, phrase) {
+			return false
+		}
+	}
+	return true
+}
+
+func EvaluateTrackerHealth(state string, trackers []torrentTrackerJSON) (string, string) {
+	if state == "error" || state == "missingFiles" {
+		return "LOCAL_ERROR", "qBittorrent state: " + state
+	}
+
+	var hasWorking bool
+	var hasStatusError bool
+	var unregisteredMsg string
+	var errorMsg string
+
+	for _, tr := range trackers {
+		if tr.Status == 0 || strings.HasPrefix(tr.URL, "** [") {
+			continue
+		}
+		if tr.Status == 2 {
+			hasWorking = true
+			continue
+		}
+		trimmedMsg := strings.TrimSpace(tr.Msg)
+		if (tr.Status == 3 || tr.Status >= 4) && MatchesUnregisteredMessage(trimmedMsg) {
+			if unregisteredMsg == "" {
+				unregisteredMsg = trimmedMsg
+			}
+		}
+		if tr.Status >= 4 {
+			hasStatusError = true
+			if errorMsg == "" && trimmedMsg != "" {
+				errorMsg = trimmedMsg
+			}
+		}
+	}
+
+	if !hasWorking {
+		if unregisteredMsg != "" {
+			return "UNREGISTERED", unregisteredMsg
+		}
+		if errorMsg != "" {
+			return "TRACKER_ERROR", errorMsg
+		}
+		if hasStatusError {
+			return "TRACKER_ERROR", "Tracker not working"
+		}
+	}
+	return "", ""
+}
+
+func ClassifyTorrentState(state, trackerHealth string) (bool, string) {
+	if trackerHealth == "UNREGISTERED" {
+		return false, "unregistered"
+	}
+	if trackerHealth == "LOCAL_ERROR" || trackerHealth == "TRACKER_ERROR" {
+		return false, "error"
+	}
 	if _, ok := seedingStates[state]; ok {
 		return true, "seeding"
 	}
@@ -217,13 +349,20 @@ func ExtractTrackerHost(trackerURL string) string {
 	return trimmed
 }
 
+type torrentTrackerJSON struct {
+	URL    string `json:"url"`
+	Status int    `json:"status"`
+	Msg    string `json:"msg"`
+}
+
 type torrentInfoJSON struct {
-	Hash     string  `json:"hash"`
-	Name     string  `json:"name"`
-	SavePath string  `json:"save_path"`
-	State    string  `json:"state"`
-	Ratio    float64 `json:"ratio"`
-	Tracker  string  `json:"tracker"`
+	Hash     string               `json:"hash"`
+	Name     string               `json:"name"`
+	SavePath string               `json:"save_path"`
+	State    string               `json:"state"`
+	Ratio    float64              `json:"ratio"`
+	Tracker  string               `json:"tracker"`
+	Trackers []torrentTrackerJSON `json:"trackers"`
 }
 
 type torrentFileJSON struct {
@@ -369,7 +508,7 @@ func (c *Client) FetchInstanceEntries(ctx context.Context, inst config.QbitInsta
 	}
 
 	var torrents []torrentInfoJSON
-	if err := doGetJSON(ctx, hc, baseURL+"/api/v2/torrents/info", &torrents); err != nil {
+	if err := doGetJSON(ctx, hc, baseURL+"/api/v2/torrents/info?includeTrackers=true", &torrents); err != nil {
 		msg := err.Error()
 		return InstanceReport{
 			InstanceID:   inst.ID,
@@ -407,6 +546,14 @@ func (c *Client) FetchInstanceEntries(ctx context.Context, inst config.QbitInsta
 				return
 			}
 
+			if len(torrent.Trackers) == 0 {
+				var trackers []torrentTrackerJSON
+				trackersURL := baseURL + "/api/v2/torrents/trackers?hash=" + url.QueryEscape(torrent.Hash)
+				if tErr := doGetJSON(ctx, hc, trackersURL, &trackers); tErr == nil {
+					torrent.Trackers = trackers
+				}
+			}
+
 			built := buildEntriesForTorrent(inst, torrent, files)
 			mu.Lock()
 			entries = append(entries, built...)
@@ -433,7 +580,8 @@ func (c *Client) FetchInstanceEntries(ctx context.Context, inst config.QbitInsta
 }
 
 func buildEntriesForTorrent(inst config.QbitInstanceConfig, t torrentInfoJSON, files []torrentFileJSON) []TorrentFileEntry {
-	isSeeding, seedingStatus := ClassifyTorrentState(t.State)
+	trackerHealth, trackerMsg := EvaluateTrackerHealth(t.State, t.Trackers)
+	isSeeding, seedingStatus := ClassifyTorrentState(t.State, trackerHealth)
 	trackerHost := ExtractTrackerHost(t.Tracker)
 	savePath := NormalizeSlashPath(t.SavePath)
 	ratio := math.Round(t.Ratio*100) / 100
@@ -461,6 +609,8 @@ func buildEntriesForTorrent(inst config.QbitInstanceConfig, t torrentInfoJSON, f
 			Ratio:         ratio,
 			Tracker:       t.Tracker,
 			TrackerHost:   trackerHost,
+			TrackerHealth: trackerHealth,
+			TrackerMsg:    trackerMsg,
 			SavePath:      savePath,
 			RelativeName:  relName,
 			MappedPath:    mapped,
