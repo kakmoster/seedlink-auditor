@@ -580,9 +580,10 @@ type ManualImportFilePayload struct {
 }
 
 type CommandResponse struct {
-	ID     int    `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
+	ID      int    `json:"id"`
+	Name    string `json:"name"`
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
 }
 
 type Client struct {
@@ -593,8 +594,19 @@ func NewClient(timeout time.Duration) *Client {
 	if timeout <= 0 {
 		timeout = 20 * time.Second
 	}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   32,
+		IdleConnTimeout:       60 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 	return &Client{
-		httpClient: &http.Client{Timeout: timeout},
+		httpClient: &http.Client{
+			Timeout:   timeout,
+			Transport: transport,
+		},
 	}
 }
 
@@ -781,71 +793,15 @@ func (c *Client) fetchInstanceData(ctx context.Context, inst config.ArrInstanceC
 		}
 
 		for _, m := range movies {
-			mappedRoot := qbit.ApplyPathMappings(m.Path, inst.PathMappings)
-			out.libraryRoots = append(out.libraryRoots, ArrLibraryEntry{
-				InstanceID:   inst.ID,
-				InstanceName: inst.Name,
-				AppType:      "radarr",
-				ItemID:       m.ID,
-				Title:        m.Title,
-				Year:         m.Year,
-				Monitored:    m.Monitored,
-				HasFile:      m.HasFile,
-				RemotePath:   qbit.NormalizeSlashPath(m.Path),
-				MappedPath:   mappedRoot,
-			})
-
-			normTitles := make([]string, 0, 2)
-			if nt := normalizeTitle(m.Title); nt != "" {
-				normTitles = append(normTitles, nt)
-			}
-			if ot := normalizeTitle(m.OriginalTitle); ot != "" && (len(normTitles) == 0 || ot != normTitles[0]) {
-				normTitles = append(normTitles, ot)
-			}
-			out.radarrTitles = append(out.radarrTitles, radarrTitleItem{
-				InstanceID:   inst.ID,
-				InstanceName: inst.Name,
-				ItemID:       m.ID,
-				Title:        m.Title,
-				NormTitles:   normTitles,
-				Year:         m.Year,
-				Monitored:    m.Monitored,
-				HasFile:      m.HasFile,
-				RootPath:     mappedRoot,
-			})
-
-			if m.MovieFile != nil {
-				rawPath := m.MovieFile.Path
-				if rawPath == "" && m.Path != "" && m.MovieFile.RelativePath != "" {
-					rawPath = qbit.NormalizeSlashPath(m.Path) + "/" + strings.TrimLeft(qbit.NormalizeSlashPath(m.MovieFile.RelativePath), "/")
-				}
-				if rawPath != "" {
-					mapped := qbit.ApplyPathMappings(rawPath, inst.PathMappings)
-					out.files = append(out.files, ArrFileEntry{
-						InstanceID:   inst.ID,
-						InstanceName: inst.Name,
-						AppType:      "radarr",
-						ItemID:       m.ID,
-						Title:        m.Title,
-						Year:         m.Year,
-						Monitored:    m.Monitored,
-						RemotePath:   qbit.NormalizeSlashPath(rawPath),
-						MappedPath:   mapped,
-						Filename:     path.Base(mapped),
-						Size:         m.MovieFile.Size,
-					})
-				}
+			libEntry, titleItem, fileEntry := radarrMovieToData(inst, m)
+			out.libraryRoots = append(out.libraryRoots, libEntry)
+			out.radarrTitles = append(out.radarrTitles, titleItem)
+			if fileEntry != nil {
+				out.files = append(out.files, *fileEntry)
 			}
 		}
 
-		var qPage arrQueuePageJSON
-		if qErr := c.doJSON(ctx, http.MethodGet, baseURL+"/api/v3/queue?page=1&pageSize=1000&includeUnknownMovieItems=true", inst.APIKey, nil, &qPage); qErr == nil {
-			for _, rec := range qPage.Records {
-				if strings.TrimSpace(rec.DownloadID) != "" {
-					out.queue = append(out.queue, summarizeQueueRecord(inst, rec))
-				}
-			}
-		}
+		out.queue = c.fetchQueueEntries(ctx, baseURL, inst)
 
 		out.report = InstanceReport{
 			InstanceID:   inst.ID,
@@ -870,36 +826,14 @@ func (c *Client) fetchInstanceData(ctx context.Context, inst config.ArrInstanceC
 		return out
 	}
 
-	seriesByID := make(map[int]sonarrSeriesJSON, len(series))
 	for _, s := range series {
-		seriesByID[s.ID] = s
-		mappedRoot := qbit.ApplyPathMappings(s.Path, inst.PathMappings)
-		out.libraryRoots = append(out.libraryRoots, ArrLibraryEntry{
-			InstanceID:   inst.ID,
-			InstanceName: inst.Name,
-			AppType:      "sonarr",
-			ItemID:       s.ID,
-			Title:        s.Title,
-			Year:         s.Year,
-			Monitored:    s.Monitored,
-			HasFile:      false,
-			RemotePath:   qbit.NormalizeSlashPath(s.Path),
-			MappedPath:   mappedRoot,
-		})
-		out.sonarrSeries = append(out.sonarrSeries, sonarrSeriesItem{
-			InstanceID:   inst.ID,
-			InstanceName: inst.Name,
-			SeriesID:     s.ID,
-			Title:        s.Title,
-			NormTitle:    normalizeTitle(s.Title),
-			Year:         s.Year,
-			Monitored:    s.Monitored,
-			RootPath:     mappedRoot,
-		})
+		libEntry, srItem := sonarrSeriesToData(inst, s)
+		out.libraryRoots = append(out.libraryRoots, libEntry)
+		out.sonarrSeries = append(out.sonarrSeries, srItem)
 	}
 
-	// Fetch episode files concurrently across series (max 10 workers)
-	sem := make(chan struct{}, 10)
+	// Fetch episode files concurrently across series (max 16 workers)
+	sem := make(chan struct{}, 16)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var epErrs []string
@@ -921,31 +855,7 @@ func (c *Client) fetchInstanceData(ctx context.Context, inst config.ArrInstanceC
 				mu.Unlock()
 				return
 			}
-			localEntries := make([]ArrFileEntry, 0, len(epFiles))
-			for _, ef := range epFiles {
-				rawPath := ef.Path
-				if rawPath == "" && sr.Path != "" && ef.RelativePath != "" {
-					rawPath = qbit.NormalizeSlashPath(sr.Path) + "/" + strings.TrimLeft(qbit.NormalizeSlashPath(ef.RelativePath), "/")
-				}
-				if rawPath == "" {
-					continue
-				}
-				mapped := qbit.ApplyPathMappings(rawPath, inst.PathMappings)
-				localEntries = append(localEntries, ArrFileEntry{
-					InstanceID:   inst.ID,
-					InstanceName: inst.Name,
-					AppType:      "sonarr",
-					ItemID:       sr.ID,
-					Title:        sr.Title,
-					Year:         sr.Year,
-					SeasonNumber: ef.SeasonNumber,
-					Monitored:    sr.Monitored,
-					RemotePath:   qbit.NormalizeSlashPath(rawPath),
-					MappedPath:   mapped,
-					Filename:     path.Base(mapped),
-					Size:         ef.Size,
-				})
-			}
+			localEntries := sonarrEpisodeFilesToEntries(inst, sr, epFiles)
 			mu.Lock()
 			out.files = append(out.files, localEntries...)
 			mu.Unlock()
@@ -978,14 +888,7 @@ func (c *Client) fetchInstanceData(ctx context.Context, inst config.ArrInstanceC
 		}
 	}
 
-	var qPage arrQueuePageJSON
-	if qErr := c.doJSON(ctx, http.MethodGet, baseURL+"/api/v3/queue?page=1&pageSize=1000&includeUnknownSeriesItems=true", inst.APIKey, nil, &qPage); qErr == nil {
-		for _, rec := range qPage.Records {
-			if strings.TrimSpace(rec.DownloadID) != "" {
-				out.queue = append(out.queue, summarizeQueueRecord(inst, rec))
-			}
-		}
-	}
+	out.queue = c.fetchQueueEntries(ctx, baseURL, inst)
 
 	var errPtr *string
 	if len(epErrs) > 0 {
@@ -1007,6 +910,162 @@ func (c *Client) fetchInstanceData(ctx context.Context, inst config.ArrInstanceC
 	return out
 }
 
+func radarrMovieToData(inst config.ArrInstanceConfig, m radarrMovieJSON) (ArrLibraryEntry, radarrTitleItem, *ArrFileEntry) {
+	mappedRoot := qbit.ApplyPathMappings(m.Path, inst.PathMappings)
+	libEntry := ArrLibraryEntry{
+		InstanceID:   inst.ID,
+		InstanceName: inst.Name,
+		AppType:      "radarr",
+		ItemID:       m.ID,
+		Title:        m.Title,
+		Year:         m.Year,
+		Monitored:    m.Monitored,
+		HasFile:      m.HasFile,
+		RemotePath:   qbit.NormalizeSlashPath(m.Path),
+		MappedPath:   mappedRoot,
+	}
+
+	normTitles := make([]string, 0, 2)
+	if nt := normalizeTitle(m.Title); nt != "" {
+		normTitles = append(normTitles, nt)
+	}
+	if ot := normalizeTitle(m.OriginalTitle); ot != "" && (len(normTitles) == 0 || ot != normTitles[0]) {
+		normTitles = append(normTitles, ot)
+	}
+	titleItem := radarrTitleItem{
+		InstanceID:   inst.ID,
+		InstanceName: inst.Name,
+		ItemID:       m.ID,
+		Title:        m.Title,
+		NormTitles:   normTitles,
+		Year:         m.Year,
+		Monitored:    m.Monitored,
+		HasFile:      m.HasFile,
+		RootPath:     mappedRoot,
+	}
+
+	var fileEntry *ArrFileEntry
+	if m.MovieFile != nil {
+		rawPath := m.MovieFile.Path
+		if rawPath == "" && m.Path != "" && m.MovieFile.RelativePath != "" {
+			rawPath = qbit.NormalizeSlashPath(m.Path) + "/" + strings.TrimLeft(qbit.NormalizeSlashPath(m.MovieFile.RelativePath), "/")
+		}
+		if rawPath != "" {
+			mapped := qbit.ApplyPathMappings(rawPath, inst.PathMappings)
+			fileEntry = &ArrFileEntry{
+				InstanceID:   inst.ID,
+				InstanceName: inst.Name,
+				AppType:      "radarr",
+				ItemID:       m.ID,
+				Title:        m.Title,
+				Year:         m.Year,
+				Monitored:    m.Monitored,
+				RemotePath:   qbit.NormalizeSlashPath(rawPath),
+				MappedPath:   mapped,
+				Filename:     path.Base(mapped),
+				Size:         m.MovieFile.Size,
+			}
+		}
+	}
+	return libEntry, titleItem, fileEntry
+}
+
+func sonarrSeriesToData(inst config.ArrInstanceConfig, s sonarrSeriesJSON) (ArrLibraryEntry, sonarrSeriesItem) {
+	mappedRoot := qbit.ApplyPathMappings(s.Path, inst.PathMappings)
+	libEntry := ArrLibraryEntry{
+		InstanceID:   inst.ID,
+		InstanceName: inst.Name,
+		AppType:      "sonarr",
+		ItemID:       s.ID,
+		Title:        s.Title,
+		Year:         s.Year,
+		Monitored:    s.Monitored,
+		HasFile:      false,
+		RemotePath:   qbit.NormalizeSlashPath(s.Path),
+		MappedPath:   mappedRoot,
+	}
+	srItem := sonarrSeriesItem{
+		InstanceID:   inst.ID,
+		InstanceName: inst.Name,
+		SeriesID:     s.ID,
+		Title:        s.Title,
+		NormTitle:    normalizeTitle(s.Title),
+		Year:         s.Year,
+		Monitored:    s.Monitored,
+		RootPath:     mappedRoot,
+	}
+	return libEntry, srItem
+}
+
+func sonarrEpisodeFilesToEntries(inst config.ArrInstanceConfig, sr sonarrSeriesJSON, epFiles []sonarrEpisodeFileJSON) []ArrFileEntry {
+	out := make([]ArrFileEntry, 0, len(epFiles))
+	for _, ef := range epFiles {
+		rawPath := ef.Path
+		if rawPath == "" && sr.Path != "" && ef.RelativePath != "" {
+			rawPath = qbit.NormalizeSlashPath(sr.Path) + "/" + strings.TrimLeft(qbit.NormalizeSlashPath(ef.RelativePath), "/")
+		}
+		if rawPath == "" {
+			continue
+		}
+		mapped := qbit.ApplyPathMappings(rawPath, inst.PathMappings)
+		out = append(out, ArrFileEntry{
+			InstanceID:   inst.ID,
+			InstanceName: inst.Name,
+			AppType:      "sonarr",
+			ItemID:       sr.ID,
+			Title:        sr.Title,
+			Year:         sr.Year,
+			SeasonNumber: ef.SeasonNumber,
+			Monitored:    sr.Monitored,
+			RemotePath:   qbit.NormalizeSlashPath(rawPath),
+			MappedPath:   mapped,
+			Filename:     path.Base(mapped),
+			Size:         ef.Size,
+		})
+	}
+	return out
+}
+
+func (c *Client) fetchQueueEntries(ctx context.Context, baseURL string, inst config.ArrInstanceConfig) []ArrQueueEntry {
+	var qURL string
+	if inst.Type == "sonarr" {
+		qURL = baseURL + "/api/v3/queue?page=1&pageSize=1000&includeUnknownSeriesItems=true"
+	} else {
+		qURL = baseURL + "/api/v3/queue?page=1&pageSize=1000&includeUnknownMovieItems=true"
+	}
+	var qPage arrQueuePageJSON
+	if err := c.doJSON(ctx, http.MethodGet, qURL, inst.APIKey, nil, &qPage); err != nil {
+		return nil
+	}
+	out := make([]ArrQueueEntry, 0, len(qPage.Records))
+	for _, rec := range qPage.Records {
+		if strings.TrimSpace(rec.DownloadID) != "" {
+			out = append(out, summarizeQueueRecord(inst, rec))
+		}
+	}
+	return out
+}
+
+func mergeFetchedToIndex(idx *Index, results []fetchedInstanceData, includeEmptyReport bool) {
+	for _, r := range results {
+		if includeEmptyReport || r.report.InstanceID != "" {
+			idx.Instances = append(idx.Instances, r.report)
+		}
+		for _, f := range r.files {
+			idx.addFileEntry(f)
+		}
+		for _, q := range r.queue {
+			idx.QueueByHash[q.DownloadID] = append(idx.QueueByHash[q.DownloadID], q)
+		}
+		idx.LibraryRoots = append(idx.LibraryRoots, r.libraryRoots...)
+		idx.RadarrTitles = append(idx.RadarrTitles, r.radarrTitles...)
+		idx.SonarrSeries = append(idx.SonarrSeries, r.sonarrSeries...)
+		for k, v := range r.wantedEpisodes {
+			idx.WantedEpisodes[k] = v
+		}
+	}
+}
+
 func (c *Client) BuildIndex(ctx context.Context, instances []config.ArrInstanceConfig) *Index {
 	idx := NewIndex()
 	if len(instances) == 0 {
@@ -1024,22 +1083,269 @@ func (c *Client) BuildIndex(ctx context.Context, instances []config.ArrInstanceC
 	}
 	wg.Wait()
 
-	for _, r := range results {
-		idx.Instances = append(idx.Instances, r.report)
-		for _, f := range r.files {
-			idx.addFileEntry(f)
+	mergeFetchedToIndex(idx, results, true)
+	return idx
+}
+
+func uniquePositiveIDs(ids []int) []int {
+	seen := make(map[int]struct{}, len(ids))
+	out := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
 		}
-		for _, q := range r.queue {
-			idx.QueueByHash[q.DownloadID] = append(idx.QueueByHash[q.DownloadID], q)
+		if _, ok := seen[id]; ok {
+			continue
 		}
-		idx.LibraryRoots = append(idx.LibraryRoots, r.libraryRoots...)
-		idx.RadarrTitles = append(idx.RadarrTitles, r.radarrTitles...)
-		idx.SonarrSeries = append(idx.SonarrSeries, r.sonarrSeries...)
-		for k, v := range r.wantedEpisodes {
-			idx.WantedEpisodes[k] = v
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func (c *Client) fetchInstanceItemsData(ctx context.Context, inst config.ArrInstanceConfig, itemIDs []int, includeQueue bool) (fetchedInstanceData, []string) {
+	out := fetchedInstanceData{
+		wantedEpisodes: make(map[wantedEpisodeKey]wantedEpisodeInfo),
+	}
+	if !inst.Enabled {
+		return out, nil
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(inst.URL), "/")
+	if baseURL == "" {
+		msg := "empty URL"
+		out.report = InstanceReport{
+			InstanceID: inst.ID, InstanceName: inst.Name, AppType: inst.Type, URL: inst.URL, OK: false, Error: &msg,
+		}
+		return out, nil
+	}
+
+	uniqueIDs := uniquePositiveIDs(itemIDs)
+	var discovered []string
+	var mu sync.Mutex
+	var errs []string
+	var wg sync.WaitGroup
+
+	if includeQueue {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			q := c.fetchQueueEntries(ctx, baseURL, inst)
+			mu.Lock()
+			out.queue = append(out.queue, q...)
+			mu.Unlock()
+		}()
+	}
+
+	sem := make(chan struct{}, 16)
+	if inst.Type == "radarr" {
+		for _, id := range uniqueIDs {
+			wg.Add(1)
+			go func(movieID int) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				var m radarrMovieJSON
+				if err := c.doJSON(ctx, http.MethodGet, fmt.Sprintf("%s/api/v3/movie/%d", baseURL, movieID), inst.APIKey, nil, &m); err != nil {
+					mu.Lock()
+					if len(errs) < 3 {
+						errs = append(errs, err.Error())
+					}
+					mu.Unlock()
+					return
+				}
+				libEntry, titleItem, fileEntry := radarrMovieToData(inst, m)
+				mu.Lock()
+				out.libraryRoots = append(out.libraryRoots, libEntry)
+				out.radarrTitles = append(out.radarrTitles, titleItem)
+				if fileEntry != nil {
+					out.files = append(out.files, *fileEntry)
+					if fileEntry.MappedPath != "" {
+						discovered = append(discovered, fileEntry.MappedPath)
+					}
+				}
+				mu.Unlock()
+			}(id)
+		}
+		wg.Wait()
+	} else {
+		var wantedFallbackOnce sync.Once
+		var missingFallbackNeeded bool
+
+		for _, id := range uniqueIDs {
+			wg.Add(1)
+			go func(seriesID int) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				var sr sonarrSeriesJSON
+				if err := c.doJSON(ctx, http.MethodGet, fmt.Sprintf("%s/api/v3/series/%d", baseURL, seriesID), inst.APIKey, nil, &sr); err != nil {
+					mu.Lock()
+					if len(errs) < 3 {
+						errs = append(errs, err.Error())
+					}
+					mu.Unlock()
+					return
+				}
+
+				libEntry, srItem := sonarrSeriesToData(inst, sr)
+				mu.Lock()
+				out.libraryRoots = append(out.libraryRoots, libEntry)
+				out.sonarrSeries = append(out.sonarrSeries, srItem)
+				mu.Unlock()
+
+				var epFiles []sonarrEpisodeFileJSON
+				if err := c.doJSON(ctx, http.MethodGet, fmt.Sprintf("%s/api/v3/episodefile?seriesId=%d", baseURL, seriesID), inst.APIKey, nil, &epFiles); err != nil {
+					mu.Lock()
+					if len(errs) < 3 {
+						errs = append(errs, err.Error())
+					}
+					mu.Unlock()
+				} else {
+					entries := sonarrEpisodeFilesToEntries(inst, sr, epFiles)
+					mu.Lock()
+					out.files = append(out.files, entries...)
+					for _, e := range entries {
+						if e.MappedPath != "" {
+							discovered = append(discovered, e.MappedPath)
+						}
+					}
+					mu.Unlock()
+				}
+
+				var episodes []sonarrWantedRecordJSON
+				if err := c.doJSON(ctx, http.MethodGet, fmt.Sprintf("%s/api/v3/episode?seriesId=%d", baseURL, seriesID), inst.APIKey, nil, &episodes); err == nil {
+					mu.Lock()
+					for _, ep := range episodes {
+						if !ep.HasFile && ep.Monitored {
+							wk := wantedEpisodeKey{
+								InstanceID: inst.ID,
+								SeriesID:   ep.SeriesID,
+								Season:     ep.SeasonNumber,
+								Episode:    ep.EpisodeNumber,
+							}
+							out.wantedEpisodes[wk] = wantedEpisodeInfo{
+								EpisodeID: ep.ID,
+								Title:     ep.Title,
+								Monitored: ep.Monitored,
+							}
+						}
+					}
+					mu.Unlock()
+				} else {
+					mu.Lock()
+					missingFallbackNeeded = true
+					mu.Unlock()
+				}
+			}(id)
+		}
+		wg.Wait()
+
+		if missingFallbackNeeded {
+			wantedFallbackOnce.Do(func() {
+				targetSet := make(map[int]struct{}, len(uniqueIDs))
+				for _, id := range uniqueIDs {
+					targetSet[id] = struct{}{}
+				}
+				var wPage sonarrWantedPageJSON
+				wURL := baseURL + "/api/v3/wanted/missing?page=1&pageSize=1000&includeSeries=true"
+				if err := c.doJSON(ctx, http.MethodGet, wURL, inst.APIKey, nil, &wPage); err == nil {
+					for _, rec := range wPage.Records {
+						if _, ok := targetSet[rec.SeriesID]; !ok {
+							continue
+						}
+						wk := wantedEpisodeKey{
+							InstanceID: inst.ID,
+							SeriesID:   rec.SeriesID,
+							Season:     rec.SeasonNumber,
+							Episode:    rec.EpisodeNumber,
+						}
+						out.wantedEpisodes[wk] = wantedEpisodeInfo{
+							EpisodeID: rec.ID,
+							Title:     rec.Title,
+							Monitored: rec.Monitored,
+						}
+					}
+				}
+			})
 		}
 	}
-	return idx
+
+	var errPtr *string
+	if len(errs) > 0 {
+		joined := strings.Join(errs, "; ")
+		errPtr = &joined
+	}
+	out.report = InstanceReport{
+		InstanceID:   inst.ID,
+		InstanceName: inst.Name,
+		AppType:      inst.Type,
+		URL:          inst.URL,
+		OK:           len(errs) == 0,
+		ItemCount:    len(uniqueIDs),
+		FileCount:    len(out.files),
+		QueueCount:   len(out.queue),
+		Error:        errPtr,
+	}
+	return out, discovered
+}
+
+// BuildIndexForItems builds a targeted Arr index for only the specified item IDs per instance
+// and returns discovered mapped media paths from those items.
+func (c *Client) BuildIndexForItems(ctx context.Context, instances []config.ArrInstanceConfig, itemIDsByInstance map[string][]int, includeQueue bool) (*Index, []string) {
+	idx := NewIndex()
+	if len(instances) == 0 || len(itemIDsByInstance) == 0 {
+		return idx, nil
+	}
+
+	results := make([]fetchedInstanceData, len(instances))
+	discoveredAll := make([][]string, len(instances))
+	var wg sync.WaitGroup
+
+	for i, inst := range instances {
+		itemIDs, ok := itemIDsByInstance[inst.ID]
+		if !ok || !inst.Enabled {
+			continue
+		}
+		wg.Add(1)
+		go func(pos int, cfg config.ArrInstanceConfig, ids []int) {
+			defer wg.Done()
+			res, paths := c.fetchInstanceItemsData(ctx, cfg, ids, includeQueue)
+			results[pos] = res
+			discoveredAll[pos] = paths
+		}(i, inst, itemIDs)
+	}
+	wg.Wait()
+
+	mergeFetchedToIndex(idx, results, false)
+	seenPaths := make(map[string]struct{})
+	discovered := make([]string, 0)
+	for _, list := range discoveredAll {
+		for _, p := range list {
+			norm := qbit.NormalizeSlashPath(p)
+			if norm == "" {
+				continue
+			}
+			if _, ok := seenPaths[norm]; ok {
+				continue
+			}
+			seenPaths[norm] = struct{}{}
+			discovered = append(discovered, norm)
+		}
+	}
+	return idx, discovered
+}
+
+// GetCommandStatus queries Radarr/Sonarr /api/v3/command/{id} to check background command progress.
+func (c *Client) GetCommandStatus(ctx context.Context, inst config.ArrInstanceConfig, commandID int) (CommandResponse, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(inst.URL), "/")
+	if baseURL == "" {
+		return CommandResponse{}, errors.New("empty Radarr/Sonarr URL")
+	}
+	var res CommandResponse
+	err := c.doJSON(ctx, http.MethodGet, fmt.Sprintf("%s/api/v3/command/%d", baseURL, commandID), inst.APIKey, nil, &res)
+	return res, err
 }
 
 func (c *Client) PreviewManualImport(ctx context.Context, inst config.ArrInstanceConfig, remoteFolder string) ([]ManualImportItem, error) {

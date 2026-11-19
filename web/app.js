@@ -18,6 +18,8 @@
     arrFilter: "ALL",
     folderFilter: "ALL",
     selectedGroupIds: new Set(),
+    pendingArrRefreshGroups: new Set(),
+    scanEpoch: 0,
     pickerTargetIndex: null,
     pickerCurrentPath: "",
     pickerParentPath: null,
@@ -506,6 +508,13 @@
             `<button class="btn btn-outline-danger btn-xs row-delete-file" data-group-id="${escapeHtml(grp.id)}" type="button">Delete File</button>`
           );
         }
+        actionBtns.push(
+          `<button class="btn btn-secondary btn-xs row-refresh" data-group-id="${escapeHtml(grp.id)}" type="button" title="Refresh disk, qBittorrent & Radarr/Sonarr status for this item">Refresh</button>`
+        );
+
+        const arrSyncHtml = state.pendingArrRefreshGroups.has(grp.id)
+          ? `<div class="arr-sync-badge">Syncing with Radarr/Sonarr...</div>`
+          : "";
 
         return `
           <tr data-group-id="${escapeHtml(grp.id)}">
@@ -530,6 +539,7 @@
             <td class="col-arr">
               ${renderArrBadge(grp.arr_summary)}
               ${arrHtml}
+              ${arrSyncHtml}
             </td>
             <td class="col-reclaim">
               <div class="reclaim-bytes ${reclaimClass}">${formatBytes(grp.reclaimable_bytes)}</div>
@@ -596,6 +606,8 @@
     btn.disabled = true;
     spinner.hidden = false;
     text.textContent = "Scanning...";
+    state.scanEpoch += 1;
+    state.pendingArrRefreshGroups.clear();
     try {
       state.scan = await apiFetch("/api/scan", { method: "POST" });
       state.selectedGroupIds.clear();
@@ -610,6 +622,166 @@
       btn.disabled = false;
       spinner.hidden = true;
       text.textContent = "Scan Now";
+    }
+  }
+
+  function expandAffectedGroupIds(actionType, groups, payload) {
+    const ids = new Set((groups || []).map((g) => g.id).filter(Boolean));
+    if (actionType === "delete-torrents" && state.scan && state.scan.groups && payload && payload.items) {
+      const deletedHashes = new Set(
+        payload.items.map((it) => String(it.torrent_hash || "").toLowerCase()).filter(Boolean)
+      );
+      for (const g of state.scan.groups) {
+        if ((g.torrents || []).some((t) => deletedHashes.has(String(t.torrent_hash || "").toLowerCase()))) {
+          ids.add(g.id);
+        }
+      }
+    }
+    return [...ids];
+  }
+
+  function collectWaitDeletedPaths(actionType, groups, payload) {
+    if (actionType !== "delete-torrents" || !payload || !payload.delete_files) {
+      return [];
+    }
+    const deletedHashes = new Set(
+      (payload.items || []).map((it) => String(it.torrent_hash || "").toLowerCase()).filter(Boolean)
+    );
+    const paths = new Set();
+    for (const g of groups || []) {
+      for (const t of g.torrents || []) {
+        if (!deletedHashes.has(String(t.torrent_hash || "").toLowerCase())) continue;
+        if (t.mapped_path) {
+          paths.add(t.mapped_path);
+        }
+        if (t.match_type === "path" && Array.isArray(t.matched_paths)) {
+          for (const mp of t.matched_paths) {
+            if (mp) paths.add(mp);
+          }
+        }
+      }
+    }
+    return [...paths];
+  }
+
+  async function refreshGroupsInPlace(groupIds, waitDeletedPaths = [], includeArr = true) {
+    const uniqueIds = [...new Set((groupIds || []).filter(Boolean))];
+    if (!state.scan || uniqueIds.length === 0) return null;
+
+    const epoch = state.scanEpoch;
+    const res = await apiFetch("/api/scan/refresh-groups", {
+      method: "POST",
+      body: JSON.stringify({
+        group_ids: uniqueIds,
+        wait_for_deleted_paths: waitDeletedPaths,
+        include_arr: includeArr,
+      }),
+    });
+    if (epoch !== state.scanEpoch) return null;
+
+    if (res.full_scan) {
+      state.scan = res.full_scan;
+      state.selectedGroupIds.clear();
+      state.pendingArrRefreshGroups.clear();
+      renderAll();
+      return res;
+    }
+
+    const removedSet = new Set(res.removed_group_ids || []);
+    const updatedMap = new Map((res.updated_groups || []).map((g) => [g.id, g]));
+
+    for (const id of removedSet) {
+      state.selectedGroupIds.delete(id);
+      state.pendingArrRefreshGroups.delete(id);
+    }
+
+    state.scan.groups = state.scan.groups
+      .filter((g) => !removedSet.has(g.id))
+      .map((g) => updatedMap.get(g.id) || g);
+
+    if (res.summary) {
+      state.scan.summary = res.summary;
+    }
+    renderTargetsStrip();
+    renderSummary();
+    renderTable();
+    return res;
+  }
+
+  async function pollArrCommandsAndRefresh(commands, groupIds) {
+    const uniqueIds = [...new Set((groupIds || []).filter(Boolean))];
+    if (uniqueIds.length === 0) return;
+
+    const epoch = state.scanEpoch;
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    let timedOut = false;
+
+    try {
+      if (commands && commands.length > 0) {
+        const maxAttempts = 40; // ~60s total at 1.5s intervals
+        let allDone = false;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          await sleep(1500);
+          if (epoch !== state.scanEpoch) return;
+
+          const statusRes = await apiFetch("/api/arr/commands/status", {
+            method: "POST",
+            body: JSON.stringify({ commands }),
+          });
+          if (epoch !== state.scanEpoch) return;
+          if (statusRes.all_done) {
+            allDone = true;
+            break;
+          }
+        }
+        timedOut = !allDone;
+      }
+
+      if (epoch !== state.scanEpoch) return;
+      for (const id of uniqueIds) {
+        state.pendingArrRefreshGroups.delete(id);
+      }
+      await refreshGroupsInPlace(uniqueIds, [], true);
+      if (epoch !== state.scanEpoch) return;
+      showToast(
+        timedOut
+          ? "Radarr/Sonarr sync still running — refreshed current status."
+          : "Radarr/Sonarr sync completed; item status updated.",
+        "success"
+      );
+    } catch (err) {
+      if (epoch !== state.scanEpoch) return;
+      for (const id of uniqueIds) {
+        state.pendingArrRefreshGroups.delete(id);
+      }
+      renderTable();
+      showToast(`Radarr/Sonarr sync check failed: ${err.message}`, "error");
+    }
+  }
+
+  async function syncSurvivingGroupsWithArr(groupIds) {
+    const uniqueIds = [...new Set((groupIds || []).filter(Boolean))];
+    if (uniqueIds.length === 0 || !state.scan) return;
+
+    const epoch = state.scanEpoch;
+    for (const id of uniqueIds) {
+      state.pendingArrRefreshGroups.add(id);
+    }
+    renderTable();
+
+    try {
+      await refreshGroupsInPlace(uniqueIds, [], true);
+    } catch (err) {
+      if (epoch === state.scanEpoch) {
+        showToast(`Radarr/Sonarr sync failed: ${err.message}`, "error");
+      }
+    } finally {
+      if (epoch === state.scanEpoch) {
+        for (const id of uniqueIds) {
+          state.pendingArrRefreshGroups.delete(id);
+        }
+        renderTable();
+      }
     }
   }
 
@@ -894,7 +1066,11 @@
       }
 
       const payload = buildActionPayloadForGroups(type, groups);
+      const affectedIds = expandAffectedGroupIds(type, groups, payload);
+      const waitDeletedPaths = collectWaitDeletedPaths(type, groups, payload);
+      const triggeredCommands = [];
       let res;
+
       if (type === "convert-hardlinks") {
         res = await apiFetch("/api/actions/convert-hardlinks", {
           method: "POST",
@@ -936,6 +1112,11 @@
           });
           totalTriggered += impRes.triggered_count;
           errCount += (impRes.errors || []).length;
+          for (const r of impRes.results || []) {
+            if (r.instance_id && r.command_id > 0) {
+              triggeredCommands.push({ instance_id: r.instance_id, command_id: r.command_id });
+            }
+          }
         }
         if (payload.rescanItems.length > 0) {
           const resRes = await apiFetch("/api/actions/arr-rescan", {
@@ -944,6 +1125,11 @@
           });
           totalTriggered += resRes.triggered_count;
           errCount += (resRes.errors || []).length;
+          for (const r of resRes.results || []) {
+            if (r.instance_id && r.command_id > 0) {
+              triggeredCommands.push({ instance_id: r.instance_id, command_id: r.command_id });
+            }
+          }
         }
         showToast(
           `Triggered ${totalTriggered} Radarr/Sonarr command(s)${errCount > 0 ? ` (${errCount} error(s))` : ""}.`,
@@ -953,7 +1139,24 @@
 
       $("actionModal").hidden = true;
       state.pendingAction = null;
-      await runScan();
+
+      if (type === "arr-import" || type === "arr-rescan" || type === "arr-fix") {
+        for (const id of affectedIds) {
+          state.pendingArrRefreshGroups.add(id);
+        }
+        renderTable();
+        void pollArrCommandsAndRefresh(triggeredCommands, affectedIds);
+      } else {
+        const refRes = await refreshGroupsInPlace(affectedIds, waitDeletedPaths, false);
+        if (refRes && !refRes.full_scan) {
+          const survivingArrIds = (refRes.updated_groups || [])
+            .filter((g) => g.arr_summary !== "UNCONFIGURED" && (g.arr_matches || []).length > 0)
+            .map((g) => g.id);
+          if (survivingArrIds.length > 0) {
+            void syncSurvivingGroupsWithArr(survivingArrIds);
+          }
+        }
+      }
     } catch (err) {
       showToast(`Action failed: ${err.message}`, "error");
     }
@@ -1331,7 +1534,7 @@
       renderTable();
     });
 
-    $("auditTableBody").addEventListener("click", (e) => {
+    $("auditTableBody").addEventListener("click", async (e) => {
       const target = e.target;
       if (target.classList.contains("row-checkbox")) {
         const gid = target.dataset.groupId;
@@ -1361,6 +1564,25 @@
         openActionModal("convert-hardlinks", [grp]);
       } else if (btn.classList.contains("row-delete-file")) {
         openActionModal("delete-files", [grp]);
+      } else if (btn.classList.contains("row-refresh")) {
+        btn.disabled = true;
+        btn.textContent = "...";
+        try {
+          const refRes = await refreshGroupsInPlace([grp.id], [], true);
+          if (refRes) {
+            if ((refRes.removed_group_ids || []).includes(grp.id)) {
+              showToast("Item no longer on disk — removed from list.", "info");
+            } else {
+              showToast(`Refreshed item in ${refRes.duration_ms} ms.`, "success");
+            }
+          }
+        } catch (err) {
+          showToast(`Row refresh failed: ${err.message}`, "error");
+          if (btn.isConnected) {
+            btn.disabled = false;
+            btn.textContent = "Refresh";
+          }
+        }
       }
     });
 

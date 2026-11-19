@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -93,10 +94,24 @@ func newMockQbitServer(t *testing.T, initial []mockTorrent) *mockQbitServer {
 			return
 		}
 		includeTrackers := r.URL.Query().Get("includeTrackers") == "true"
+		var filterHashes map[string]struct{}
+		if hashesParam := strings.TrimSpace(r.URL.Query().Get("hashes")); hashesParam != "" {
+			filterHashes = make(map[string]struct{})
+			for _, part := range strings.Split(hashesParam, "|") {
+				if p := strings.ToLower(strings.TrimSpace(part)); p != "" {
+					filterHashes[p] = struct{}{}
+				}
+			}
+		}
 		mq.mu.Lock()
 		defer mq.mu.Unlock()
 		list := make([]map[string]any, 0, len(mq.torrents))
 		for _, mt := range mq.torrents {
+			if filterHashes != nil {
+				if _, ok := filterHashes[strings.ToLower(strings.TrimSpace(mt.Hash))]; !ok {
+					continue
+				}
+			}
 			row := map[string]any{
 				"hash":      mt.Hash,
 				"name":      mt.Name,
@@ -816,22 +831,24 @@ func TestExportAndBrowseEndpoints(t *testing.T) {
 }
 
 type mockArrServer struct {
-	mu           sync.Mutex
-	commands     []map[string]any
-	server       *httptest.Server
-	movies       []map[string]any
-	series       []map[string]any
-	episodeFiles map[string][]map[string]any
-	wanted       []map[string]any
-	queue        []map[string]any
-	manualItems  []map[string]any
+	mu              sync.Mutex
+	commands        []map[string]any
+	commandStatuses map[int]string
+	server          *httptest.Server
+	movies          []map[string]any
+	series          []map[string]any
+	episodeFiles    map[string][]map[string]any
+	wanted          []map[string]any
+	queue           []map[string]any
+	manualItems     []map[string]any
 }
 
 func newMockArrServer(t *testing.T, appType string) *mockArrServer {
 	t.Helper()
 	ma := &mockArrServer{
-		commands:     make([]map[string]any, 0),
-		episodeFiles: make(map[string][]map[string]any),
+		commands:        make([]map[string]any, 0),
+		commandStatuses: make(map[int]string),
+		episodeFiles:    make(map[string][]map[string]any),
 	}
 
 	mux := http.NewServeMux()
@@ -865,6 +882,26 @@ func newMockArrServer(t *testing.T, appType string) *mockArrServer {
 		_ = json.NewEncoder(w).Encode(ma.movies)
 	})
 
+	mux.HandleFunc("GET /api/v3/movie/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if !requireKey(w, r) {
+			return
+		}
+		idVal, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		ma.mu.Lock()
+		defer ma.mu.Unlock()
+		for _, m := range ma.movies {
+			if id, ok := m["id"].(int); ok && id == idVal {
+				_ = json.NewEncoder(w).Encode(m)
+				return
+			}
+		}
+		http.NotFound(w, r)
+	})
+
 	mux.HandleFunc("/api/v3/series", func(w http.ResponseWriter, r *http.Request) {
 		if !requireKey(w, r) {
 			return
@@ -872,6 +909,26 @@ func newMockArrServer(t *testing.T, appType string) *mockArrServer {
 		ma.mu.Lock()
 		defer ma.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(ma.series)
+	})
+
+	mux.HandleFunc("GET /api/v3/series/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if !requireKey(w, r) {
+			return
+		}
+		idVal, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		ma.mu.Lock()
+		defer ma.mu.Unlock()
+		for _, s := range ma.series {
+			if id, ok := s["id"].(int); ok && id == idVal {
+				_ = json.NewEncoder(w).Encode(s)
+				return
+			}
+		}
+		http.NotFound(w, r)
 	})
 
 	mux.HandleFunc("/api/v3/episodefile", func(w http.ResponseWriter, r *http.Request) {
@@ -949,11 +1006,38 @@ func newMockArrServer(t *testing.T, appType string) *mockArrServer {
 		ma.mu.Lock()
 		ma.commands = append(ma.commands, cmd)
 		cmdID := len(ma.commands)
+		ma.commandStatuses[cmdID] = "queued"
 		ma.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id":     cmdID,
 			"name":   cmd["name"],
 			"status": "queued",
+		})
+	})
+
+	mux.HandleFunc("GET /api/v3/command/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if !requireKey(w, r) {
+			return
+		}
+		cmdID, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		ma.mu.Lock()
+		defer ma.mu.Unlock()
+		if cmdID <= 0 || cmdID > len(ma.commands) {
+			http.NotFound(w, r)
+			return
+		}
+		status := ma.commandStatuses[cmdID]
+		if status == "" {
+			status = "queued"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":     cmdID,
+			"name":   ma.commands[cmdID-1]["name"],
+			"status": status,
 		})
 	})
 
@@ -1321,5 +1405,282 @@ func TestRadarrAndSonarrIntegration(t *testing.T) {
 	}
 	if cmds[2]["name"] != "RefreshMovie" {
 		t.Fatalf("unexpected RefreshMovie payload: %+v", cmds[2])
+	}
+}
+
+func TestRefreshGroupsAndArrCommandStatus(t *testing.T) {
+	root := t.TempDir()
+	plexDir := filepath.Join(root, "plex")
+	dlDir := filepath.Join(root, "downloads")
+	if err := os.MkdirAll(filepath.Join(plexDir, "movies"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dlDir, "movies"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. DUPLICATE_COPY between Plex & Downloads (separate writes => distinct inodes)
+	dupSize := 32 * 1024
+	dupPayload := makePayload("dup-movie", dupSize)
+	dupPlex := filepath.Join(plexDir, "movies", "Dune (2021)", "Dune.2021.1080p.mkv")
+	dupDl := filepath.Join(dlDir, "movies", "Dune.2021.1080p.mkv")
+	writeTestFile(t, dupPlex, dupPayload)
+	writeTestFile(t, dupDl, dupPayload)
+
+	// 2. ORPHANED_IN_B tracked in mock qBit (later deleted via wait_for_deleted_paths)
+	orphanSize := 28 * 1024
+	orphanDl := filepath.Join(dlDir, "movies", "Orphan.Sample.2020.mkv")
+	writeTestFile(t, orphanDl, makePayload("orphan-seed", orphanSize))
+
+	// 3. ORPHANED_IN_B + WANTED_NOT_IMPORTED in Radarr + tracked in qBit
+	wantedSize := 40 * 1024
+	wantedDl := filepath.Join(dlDir, "movies", "The.Matrix.1999.2160p.mkv")
+	writeTestFile(t, wantedDl, makePayload("matrix-wanted", wantedSize))
+
+	mq := newMockQbitServer(t, []mockTorrent{
+		{
+			Hash:     "1111222233334444555566667777888899990000",
+			Name:     "Orphan.Sample.2020",
+			SavePath: qbit.NormalizeSlashPath(dlDir),
+			State:    "stalledUP",
+			Ratio:    2.0,
+			Tracker:  "https://tracker.example/announce",
+			Trackers: []mockTracker{{URL: "https://tracker.example/announce", Status: 2}},
+			Files: []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+			}{{Name: "movies/Orphan.Sample.2020.mkv", Size: int64(orphanSize)}},
+		},
+		{
+			Hash:     "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+			Name:     "The.Matrix.1999.2160p",
+			SavePath: qbit.NormalizeSlashPath(dlDir),
+			State:    "uploading",
+			Ratio:    1.2,
+			Tracker:  "https://tracker.example/announce",
+			Trackers: []mockTracker{{URL: "https://tracker.example/announce", Status: 2}},
+			Files: []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+			}{{Name: "movies/The.Matrix.1999.2160p.mkv", Size: int64(wantedSize)}},
+		},
+	})
+
+	radarrMock := newMockArrServer(t, "radarr")
+	radarrMock.movies = []map[string]any{
+		{
+			"id":        20,
+			"title":     "The Matrix",
+			"year":      1999,
+			"path":      "/media/movies/The Matrix (1999)",
+			"hasFile":   false,
+			"monitored": true,
+		},
+	}
+
+	cfgMgr, err := config.NewManager(filepath.Join(root, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cfgMgr.Update(config.AppSettings{
+		ReadOnlyMode: false,
+		Folders: []config.FolderConfig{
+			{ID: "plex", Label: "Plex", Path: plexDir, Role: "primary"},
+			{ID: "dl", Label: "Downloads", Path: dlDir, Role: "secondary"},
+		},
+		QbitInstances: []config.QbitInstanceConfig{
+			{ID: "q1", Name: "qBit", URL: mq.server.URL, Username: "admin", Password: "secret", Enabled: true},
+		},
+		ArrInstances: []config.ArrInstanceConfig{
+			{
+				ID:      "rad1",
+				Name:    "Radarr",
+				Type:    "radarr",
+				URL:     radarrMock.server.URL,
+				APIKey:  "arr-secret-key",
+				Enabled: true,
+				PathMappings: []config.PathMapping{
+					{RemotePrefix: "/media", LocalPrefix: qbit.NormalizeSlashPath(plexDir)},
+					{RemotePrefix: "/arr_downloads", LocalPrefix: qbit.NormalizeSlashPath(dlDir)},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(server.New(cfgMgr, qbit.NewClient(5*time.Second), arr.NewClient(5*time.Second), nil))
+	t.Cleanup(ts.Close)
+
+	// Full initial scan
+	var scanRes scanner.ScanResult
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/scan", nil, &scanRes); c != http.StatusOK {
+		t.Fatalf("expected 200 on /api/scan, got %d", c)
+	}
+	if scanRes.Summary.TotalGroups != 3 || scanRes.Summary.DuplicateCopyCount != 1 || scanRes.Summary.OrphanedInBCount != 2 {
+		t.Fatalf("unexpected initial scan summary: %+v", scanRes.Summary)
+	}
+
+	findGroup := func(groups []scanner.ComparisonGroup, substr string) (scanner.ComparisonGroup, bool) {
+		for _, g := range groups {
+			if strings.Contains(g.Filename, substr) {
+				return g, true
+			}
+		}
+		return scanner.ComparisonGroup{}, false
+	}
+
+	dupGrp, ok := findGroup(scanRes.Groups, "Dune.2021")
+	if !ok || dupGrp.Status != "DUPLICATE_COPY" || len(dupGrp.HardlinkPairs) != 1 {
+		t.Fatalf("expected DUPLICATE_COPY group for Dune, got ok=%v %+v", ok, dupGrp)
+	}
+	orphanGrp, ok := findGroup(scanRes.Groups, "Orphan.Sample")
+	if !ok || orphanGrp.Status != "ORPHANED_IN_B" || len(orphanGrp.Torrents) != 1 {
+		t.Fatalf("expected ORPHANED_IN_B group for Orphan.Sample, got ok=%v %+v", ok, orphanGrp)
+	}
+	wantedGrp, ok := findGroup(scanRes.Groups, "The.Matrix.1999")
+	if !ok || wantedGrp.Status != "ORPHANED_IN_B" || wantedGrp.ArrSummary != "WANTED_NOT_IMPORTED" {
+		t.Fatalf("expected WANTED_NOT_IMPORTED orphaned group for Matrix, got ok=%v %+v", ok, wantedGrp)
+	}
+
+	type refreshResponse struct {
+		Summary         scanner.Summary           `json:"summary"`
+		UpdatedGroups   []scanner.ComparisonGroup `json:"updated_groups"`
+		RemovedGroupIDs []string                  `json:"removed_group_ids"`
+		DurationMS      float64                   `json:"duration_ms"`
+	}
+
+	// A. Convert DUPLICATE_COPY -> HARDLINKED and refresh just dupGrp
+	var hlRes actions.ConvertHardlinksResult
+	hlPayload := map[string]any{
+		"pairs":   dupGrp.HardlinkPairs,
+		"dry_run": false,
+	}
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/actions/convert-hardlinks", hlPayload, &hlRes); c != http.StatusOK || hlRes.ConvertedCount != 1 {
+		t.Fatalf("expected convert-hardlinks to succeed, got code=%d res=%+v", c, hlRes)
+	}
+
+	var refHL refreshResponse
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/scan/refresh-groups", map[string]any{
+		"group_ids":   []string{dupGrp.ID},
+		"include_arr": false,
+	}, &refHL); c != http.StatusOK {
+		t.Fatalf("expected 200 on refresh-groups after hardlink, got %d", c)
+	}
+	if len(refHL.UpdatedGroups) != 1 || refHL.UpdatedGroups[0].Status != "HARDLINKED" || refHL.UpdatedGroups[0].ReclaimableBytes != 0 {
+		t.Fatalf("expected Dune group to flip to HARDLINKED with 0 reclaimable, got %+v", refHL.UpdatedGroups)
+	}
+	if refHL.Summary.DuplicateCopyCount != 0 || refHL.Summary.HardlinkedCount != 1 {
+		t.Fatalf("expected summary counts to update after targeted hardlink refresh, got %+v", refHL.Summary)
+	}
+
+	// B. Refresh wantedGrp with include_arr: false preserves ArrSummary & ArrMatches
+	var refNoArr refreshResponse
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/scan/refresh-groups", map[string]any{
+		"group_ids":   []string{wantedGrp.ID},
+		"include_arr": false,
+	}, &refNoArr); c != http.StatusOK || len(refNoArr.UpdatedGroups) != 1 {
+		t.Fatalf("expected 200 on include_arr=false refresh, got %d %+v", c, refNoArr)
+	}
+	if refNoArr.UpdatedGroups[0].ArrSummary != "WANTED_NOT_IMPORTED" || len(refNoArr.UpdatedGroups[0].ArrMatches) == 0 {
+		t.Fatalf("expected include_arr=false to preserve ArrSummary/ArrMatches, got %+v", refNoArr.UpdatedGroups[0])
+	}
+
+	// C. Simulate Radarr import (hardlink into Plex + movieFile in radarrMock) and refresh with include_arr: true
+	wantedPlex := filepath.Join(plexDir, "movies", "The Matrix (1999)", "The Matrix (1999).mkv")
+	if err := os.MkdirAll(filepath.Dir(wantedPlex), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(wantedDl, wantedPlex); err != nil {
+		t.Fatal(err)
+	}
+	radarrMock.mu.Lock()
+	radarrMock.movies[0]["hasFile"] = true
+	radarrMock.movies[0]["movieFile"] = map[string]any{
+		"id":           201,
+		"path":         "/media/movies/The Matrix (1999)/The Matrix (1999).mkv",
+		"relativePath": "The Matrix (1999).mkv",
+		"size":         wantedSize,
+	}
+	radarrMock.mu.Unlock()
+
+	var refArr refreshResponse
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/scan/refresh-groups", map[string]any{
+		"group_ids":   []string{wantedGrp.ID},
+		"include_arr": true,
+	}, &refArr); c != http.StatusOK || len(refArr.UpdatedGroups) != 1 {
+		t.Fatalf("expected 200 on include_arr=true refresh, got %d %+v", c, refArr)
+	}
+	if refArr.UpdatedGroups[0].Status != "HARDLINKED" || refArr.UpdatedGroups[0].ArrSummary != "IMPORTED" {
+		t.Fatalf("expected Matrix group to become HARDLINKED & IMPORTED, got %+v", refArr.UpdatedGroups[0])
+	}
+	if refArr.Summary.HardlinkedCount != 2 || refArr.Summary.ArrImportedCount != 1 || refArr.Summary.ArrWantedNotImportedCount != 0 {
+		t.Fatalf("unexpected summary after Matrix import refresh: %+v", refArr.Summary)
+	}
+
+	// D. Async file deletion + wait_for_deleted_paths removes group & updates summary
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		_ = os.Remove(orphanDl)
+	}()
+
+	var refDel refreshResponse
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/scan/refresh-groups", map[string]any{
+		"group_ids":              []string{orphanGrp.ID},
+		"wait_for_deleted_paths": []string{qbit.NormalizeSlashPath(orphanDl)},
+		"include_arr":            false,
+	}, &refDel); c != http.StatusOK {
+		t.Fatalf("expected 200 on wait_for_deleted_paths refresh, got %d", c)
+	}
+	if len(refDel.RemovedGroupIDs) != 1 || refDel.RemovedGroupIDs[0] != orphanGrp.ID {
+		t.Fatalf("expected removed_group_ids=[%s], got %+v", orphanGrp.ID, refDel.RemovedGroupIDs)
+	}
+	if refDel.Summary.TotalGroups != 2 || refDel.Summary.OrphanedInBCount != 0 {
+		t.Fatalf("expected TotalGroups=2 and OrphanedInBCount=0 after deletion, got %+v", refDel.Summary)
+	}
+
+	// E. Arr command status polling: queued -> completed
+	var impRes actions.ArrImportResult
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/actions/arr-import", map[string]any{
+		"items": []map[string]any{{
+			"instance_id":        "rad1",
+			"local_path":         wantedDl,
+			"download_client_id": "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+			"item_id":            20,
+		}},
+		"force_manual_import": false,
+		"dry_run":             false,
+	}, &impRes); c != http.StatusOK || impRes.TriggeredCount != 1 || impRes.Results[0].CommandID <= 0 {
+		t.Fatalf("expected arr-import with command_id, got code=%d res=%+v", c, impRes)
+	}
+	cmdID := impRes.Results[0].CommandID
+
+	type cmdStatusResp struct {
+		AllDone  bool `json:"all_done"`
+		Commands []struct {
+			InstanceID string `json:"instance_id"`
+			CommandID  int    `json:"command_id"`
+			Status     string `json:"status"`
+			Done       bool   `json:"done"`
+		} `json:"commands"`
+	}
+
+	var st1 cmdStatusResp
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/arr/commands/status", map[string]any{
+		"commands": []map[string]any{{"instance_id": "rad1", "command_id": cmdID}},
+	}, &st1); c != http.StatusOK || st1.AllDone || len(st1.Commands) != 1 || st1.Commands[0].Status != "queued" {
+		t.Fatalf("expected queued/not-done command status, got code=%d %+v", c, st1)
+	}
+
+	radarrMock.mu.Lock()
+	radarrMock.commandStatuses[cmdID] = "completed"
+	radarrMock.mu.Unlock()
+
+	var st2 cmdStatusResp
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/arr/commands/status", map[string]any{
+		"commands": []map[string]any{{"instance_id": "rad1", "command_id": cmdID}},
+	}, &st2); c != http.StatusOK || !st2.AllDone || len(st2.Commands) != 1 || st2.Commands[0].Status != "completed" {
+		t.Fatalf("expected completed/done command status, got code=%d %+v", c, st2)
 	}
 }

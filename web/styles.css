@@ -923,6 +923,26 @@ code {
   word-break: break-word;
 }
 
+.arr-sync-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 5px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  animation: arrSyncPulse 1.6s ease-in-out infinite;
+}
+
+@keyframes arrSyncPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+
 .reclaim-bytes {
   font-weight: 700;
   font-size: 0.92rem;

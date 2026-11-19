@@ -371,14 +371,26 @@ type torrentFileJSON struct {
 }
 
 type Client struct {
-	timeout time.Duration
+	timeout   time.Duration
+	transport *http.Transport
 }
 
 func NewClient(timeout time.Duration) *Client {
 	if timeout <= 0 {
 		timeout = 20 * time.Second
 	}
-	return &Client{timeout: timeout}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   32,
+		IdleConnTimeout:       60 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	return &Client{
+		timeout:   timeout,
+		transport: transport,
+	}
 }
 
 func (c *Client) newAuthedHTTPClient(ctx context.Context, inst config.QbitInstanceConfig) (*http.Client, string, error) {
@@ -392,8 +404,9 @@ func (c *Client) newAuthedHTTPClient(ctx context.Context, inst config.QbitInstan
 		return nil, "", err
 	}
 	hc := &http.Client{
-		Timeout: c.timeout,
-		Jar:     jar,
+		Timeout:   c.timeout,
+		Jar:       jar,
+		Transport: c.transport,
 	}
 
 	form := url.Values{}
@@ -519,7 +532,28 @@ func (c *Client) FetchInstanceEntries(ctx context.Context, inst config.QbitInsta
 		}, nil
 	}
 
-	sem := make(chan struct{}, 10)
+	entries, errs := c.enrichTorrentsEntries(ctx, hc, baseURL, inst, torrents)
+
+	var errPtr *string
+	if len(errs) > 0 {
+		joined := strings.Join(errs, "; ")
+		errPtr = &joined
+	}
+
+	return InstanceReport{
+		InstanceID:   inst.ID,
+		InstanceName: inst.Name,
+		URL:          inst.URL,
+		OK:           len(errs) == 0,
+		TorrentCount: len(torrents),
+		FileCount:    len(entries),
+		Error:        errPtr,
+	}, entries
+}
+
+// enrichTorrentsEntries fetches per-torrent file lists and fallback tracker statuses concurrently.
+func (c *Client) enrichTorrentsEntries(ctx context.Context, hc *http.Client, baseURL string, inst config.QbitInstanceConfig, torrents []torrentInfoJSON) ([]TorrentFileEntry, []string) {
+	sem := make(chan struct{}, 16)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	entries := make([]TorrentFileEntry, 0, len(torrents))
@@ -561,22 +595,7 @@ func (c *Client) FetchInstanceEntries(ctx context.Context, inst config.QbitInsta
 		}(t)
 	}
 	wg.Wait()
-
-	var errPtr *string
-	if len(errs) > 0 {
-		joined := strings.Join(errs, "; ")
-		errPtr = &joined
-	}
-
-	return InstanceReport{
-		InstanceID:   inst.ID,
-		InstanceName: inst.Name,
-		URL:          inst.URL,
-		OK:           len(errs) == 0,
-		TorrentCount: len(torrents),
-		FileCount:    len(entries),
-		Error:        errPtr,
-	}, entries
+	return entries, errs
 }
 
 func buildEntriesForTorrent(inst config.QbitInstanceConfig, t torrentInfoJSON, files []torrentFileJSON) []TorrentFileEntry {
@@ -646,6 +665,122 @@ func (c *Client) BuildIndex(ctx context.Context, instances []config.QbitInstance
 	wg.Wait()
 
 	for _, r := range results {
+		idx.Instances = append(idx.Instances, r.report)
+		for _, e := range r.entries {
+			idx.AddEntry(e)
+		}
+	}
+	return idx
+}
+
+func uniqueNonEmptyHashes(hashes []string) ([]string, map[string]struct{}) {
+	seen := make(map[string]struct{}, len(hashes))
+	unique := make([]string, 0, len(hashes))
+	for _, h := range hashes {
+		trimmed := strings.TrimSpace(h)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if _, ok := seen[lower]; ok {
+			continue
+		}
+		seen[lower] = struct{}{}
+		unique = append(unique, trimmed)
+	}
+	return unique, seen
+}
+
+// FetchTorrentsByHashes fetches file and tracker entries for only the specified torrent hashes.
+func (c *Client) FetchTorrentsByHashes(ctx context.Context, inst config.QbitInstanceConfig, hashes []string) ([]TorrentFileEntry, error) {
+	if !inst.Enabled {
+		return nil, nil
+	}
+	unique, wantSet := uniqueNonEmptyHashes(hashes)
+	if len(unique) == 0 {
+		return nil, nil
+	}
+
+	hc, baseURL, err := c.newAuthedHTTPClient(ctx, inst)
+	if err != nil {
+		return nil, err
+	}
+
+	const batchSize = 50
+	matchedTorrents := make([]torrentInfoJSON, 0, len(unique))
+	for i := 0; i < len(unique); i += batchSize {
+		end := i + batchSize
+		if end > len(unique) {
+			end = len(unique)
+		}
+		infoURL := baseURL + "/api/v2/torrents/info?hashes=" + url.QueryEscape(strings.Join(unique[i:end], "|")) + "&includeTrackers=true"
+		var batch []torrentInfoJSON
+		if err := doGetJSON(ctx, hc, infoURL, &batch); err != nil {
+			return nil, err
+		}
+		for _, t := range batch {
+			if _, ok := wantSet[strings.ToLower(strings.TrimSpace(t.Hash))]; ok {
+				matchedTorrents = append(matchedTorrents, t)
+			}
+		}
+	}
+
+	if len(matchedTorrents) == 0 {
+		return nil, nil
+	}
+
+	entries, errs := c.enrichTorrentsEntries(ctx, hc, baseURL, inst, matchedTorrents)
+	if len(errs) > 0 {
+		return entries, errors.New(strings.Join(errs, "; "))
+	}
+	return entries, nil
+}
+
+// BuildIndexForHashes constructs a targeted qBittorrent index querying only the requested hashes per instance.
+func (c *Client) BuildIndexForHashes(ctx context.Context, instances []config.QbitInstanceConfig, hashesByInstance map[string][]string) *Index {
+	idx := NewIndex()
+	if len(instances) == 0 || len(hashesByInstance) == 0 {
+		return idx
+	}
+
+	type result struct {
+		report  InstanceReport
+		entries []TorrentFileEntry
+		present bool
+	}
+
+	results := make([]result, len(instances))
+	var wg sync.WaitGroup
+	for i, inst := range instances {
+		hashes := hashesByInstance[inst.ID]
+		if !inst.Enabled || len(hashes) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(pos int, cfg config.QbitInstanceConfig, targetHashes []string) {
+			defer wg.Done()
+			entries, err := c.FetchTorrentsByHashes(ctx, cfg, targetHashes)
+			rep := InstanceReport{
+				InstanceID:   cfg.ID,
+				InstanceName: cfg.Name,
+				URL:          cfg.URL,
+				OK:           err == nil,
+				TorrentCount: len(targetHashes),
+				FileCount:    len(entries),
+			}
+			if err != nil {
+				msg := err.Error()
+				rep.Error = &msg
+			}
+			results[pos] = result{report: rep, entries: entries, present: true}
+		}(i, inst, hashes)
+	}
+	wg.Wait()
+
+	for _, r := range results {
+		if !r.present {
+			continue
+		}
 		idx.Instances = append(idx.Instances, r.report)
 		for _, e := range r.entries {
 			idx.AddEntry(e)
