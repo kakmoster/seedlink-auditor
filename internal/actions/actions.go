@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"seedlink-auditor/internal/arr"
 	"seedlink-auditor/internal/config"
 	"seedlink-auditor/internal/qbit"
 	"seedlink-auditor/internal/scanner"
@@ -580,4 +581,294 @@ func DeleteDiskFiles(settings config.AppSettings, filePaths []string, cleanupEmp
 		RemovedDirs:    removedDirs,
 		Errors:         errs,
 	}, nil
+}
+
+type ArrImportItem struct {
+	InstanceID       string `json:"instance_id"`
+	LocalPath        string `json:"local_path"`
+	DownloadClientID string `json:"download_client_id"`
+	ItemID           int    `json:"item_id"`
+	EpisodeIDs       []int  `json:"episode_ids"`
+}
+
+type ArrImportEntryResult struct {
+	InstanceID       string   `json:"instance_id"`
+	InstanceName     string   `json:"instance_name"`
+	AppType          string   `json:"app_type"`
+	LocalPath        string   `json:"local_path"`
+	RemotePath       string   `json:"remote_path"`
+	ParsedTitle      string   `json:"parsed_title,omitempty"`
+	Rejections       []string `json:"rejections"`
+	CommandName      string   `json:"command_name"`
+	CommandID        int      `json:"command_id,omitempty"`
+	CommandStatus    string   `json:"command_status,omitempty"`
+	ManualMatchFound bool     `json:"manual_match_found"`
+}
+
+type ArrActionError struct {
+	InstanceID string `json:"instance_id"`
+	Target     string `json:"target"`
+	Error      string `json:"error"`
+}
+
+type ArrImportResult struct {
+	DryRun            bool                   `json:"dry_run"`
+	ForceManualImport bool                   `json:"force_manual_import"`
+	TriggeredCount    int                    `json:"triggered_count"`
+	Results           []ArrImportEntryResult `json:"results"`
+	Errors            []ArrActionError       `json:"errors"`
+}
+
+type ArrRescanItem struct {
+	InstanceID string `json:"instance_id"`
+	ItemID     int    `json:"item_id"`
+	Title      string `json:"title"`
+}
+
+type ArrRescanEntryResult struct {
+	InstanceID    string `json:"instance_id"`
+	InstanceName  string `json:"instance_name"`
+	AppType       string `json:"app_type"`
+	ItemID        int    `json:"item_id"`
+	Title         string `json:"title"`
+	CommandName   string `json:"command_name"`
+	CommandID     int    `json:"command_id,omitempty"`
+	CommandStatus string `json:"command_status,omitempty"`
+}
+
+type ArrRescanResult struct {
+	DryRun         bool                   `json:"dry_run"`
+	TriggeredCount int                    `json:"triggered_count"`
+	Results        []ArrRescanEntryResult `json:"results"`
+	Errors         []ArrActionError       `json:"errors"`
+}
+
+func TriggerArrImportAction(
+	ctx context.Context,
+	settings config.AppSettings,
+	arrClient *arr.Client,
+	items []ArrImportItem,
+	forceManualImport bool,
+	dryRun bool,
+) (ArrImportResult, error) {
+	if err := ensureWritable(settings, dryRun); err != nil {
+		return ArrImportResult{}, err
+	}
+
+	instancesByID := make(map[string]config.ArrInstanceConfig, len(settings.ArrInstances))
+	for _, inst := range settings.ArrInstances {
+		instancesByID[inst.ID] = inst
+	}
+
+	res := ArrImportResult{
+		DryRun:            dryRun,
+		ForceManualImport: forceManualImport,
+		Results:           make([]ArrImportEntryResult, 0, len(items)),
+		Errors:            make([]ArrActionError, 0),
+	}
+
+	for _, it := range items {
+		inst, ok := instancesByID[strings.TrimSpace(it.InstanceID)]
+		if !ok {
+			res.Errors = append(res.Errors, ArrActionError{
+				InstanceID: it.InstanceID, Target: it.LocalPath, Error: "Unknown Radarr/Sonarr instance ID.",
+			})
+			continue
+		}
+		localPath := strings.TrimSpace(it.LocalPath)
+		if localPath == "" || isWithinConfiguredFolders(localPath, settings.Folders) == nil {
+			res.Errors = append(res.Errors, ArrActionError{
+				InstanceID: inst.ID, Target: localPath, Error: "Local path is empty or outside configured folders.",
+			})
+			continue
+		}
+
+		remotePath := arr.ToRemotePath(localPath, inst.PathMappings)
+		remoteFolder := arr.ToRemotePath(filepath.Dir(localPath), inst.PathMappings)
+		baseName := filepath.Base(localPath)
+
+		var matchedPreview *arr.ManualImportItem
+		rejections := make([]string, 0)
+		parsedTitle := ""
+
+		previewItems, pErr := arrClient.PreviewManualImport(ctx, inst, remoteFolder)
+		if pErr == nil {
+			normRemote := qbit.NormalizeSlashPath(remotePath)
+			for i := range previewItems {
+				cand := &previewItems[i]
+				candNorm := qbit.NormalizeSlashPath(cand.Path)
+				if strings.EqualFold(candNorm, normRemote) || strings.EqualFold(filepath.Base(candNorm), baseName) || strings.EqualFold(cand.Name, baseName) {
+					matchedPreview = cand
+					break
+				}
+			}
+			if matchedPreview != nil {
+				if matchedPreview.Movie != nil {
+					parsedTitle = fmt.Sprintf("%s (%d)", matchedPreview.Movie.Title, matchedPreview.Movie.Year)
+				} else if matchedPreview.Series != nil {
+					parsedTitle = matchedPreview.Series.Title
+					if len(matchedPreview.Episodes) > 0 {
+						ep := matchedPreview.Episodes[0]
+						parsedTitle = fmt.Sprintf("%s S%02dE%02d", matchedPreview.Series.Title, ep.SeasonNumber, ep.EpisodeNumber)
+					}
+				}
+				for _, rej := range matchedPreview.Rejections {
+					if strings.TrimSpace(rej.Reason) != "" {
+						rejections = append(rejections, strings.TrimSpace(rej.Reason))
+					}
+				}
+			}
+		} else {
+			rejections = append(rejections, fmt.Sprintf("ManualImport preview note: %v", pErr))
+		}
+
+		cmdName := "DownloadedMoviesScan"
+		if inst.Type == "sonarr" {
+			cmdName = "DownloadedEpisodesScan"
+		}
+		if forceManualImport && matchedPreview != nil {
+			cmdName = "ManualImport"
+		}
+
+		entryRes := ArrImportEntryResult{
+			InstanceID:       inst.ID,
+			InstanceName:     inst.Name,
+			AppType:          inst.Type,
+			LocalPath:        localPath,
+			RemotePath:       remotePath,
+			ParsedTitle:      parsedTitle,
+			Rejections:       rejections,
+			CommandName:      cmdName,
+			ManualMatchFound: matchedPreview != nil,
+		}
+
+		if !dryRun {
+			var cmdResp arr.CommandResponse
+			var cmdErr error
+			if forceManualImport && matchedPreview != nil {
+				dlID := matchedPreview.DownloadID
+				if dlID == "" && strings.TrimSpace(it.DownloadClientID) != "" {
+					dlID = strings.ToUpper(strings.TrimSpace(it.DownloadClientID))
+				}
+				payload := arr.ManualImportFilePayload{
+					Path:         matchedPreview.Path,
+					FolderName:   filepath.Base(filepath.Dir(matchedPreview.Path)),
+					Quality:      matchedPreview.Quality,
+					Languages:    matchedPreview.Languages,
+					ReleaseGroup: matchedPreview.ReleaseGroup,
+					IndexerFlags: matchedPreview.IndexerFlags,
+					DownloadID:   dlID,
+				}
+				if inst.Type == "radarr" {
+					if matchedPreview.Movie != nil && matchedPreview.Movie.ID > 0 {
+						payload.MovieID = matchedPreview.Movie.ID
+					} else if it.ItemID > 0 {
+						payload.MovieID = it.ItemID
+					}
+				} else {
+					if matchedPreview.Series != nil && matchedPreview.Series.ID > 0 {
+						payload.SeriesID = matchedPreview.Series.ID
+					} else if it.ItemID > 0 {
+						payload.SeriesID = it.ItemID
+					}
+					if len(matchedPreview.Episodes) > 0 {
+						for _, ep := range matchedPreview.Episodes {
+							payload.EpisodeIDs = append(payload.EpisodeIDs, ep.ID)
+						}
+					} else if len(it.EpisodeIDs) > 0 {
+						payload.EpisodeIDs = it.EpisodeIDs
+					}
+				}
+				cmdResp, cmdErr = arrClient.TriggerManualImport(ctx, inst, []arr.ManualImportFilePayload{payload})
+			} else {
+				cmdResp, cmdErr = arrClient.TriggerDownloadScan(ctx, inst, remotePath, strings.ToUpper(strings.TrimSpace(it.DownloadClientID)))
+			}
+			if cmdErr != nil {
+				res.Errors = append(res.Errors, ArrActionError{
+					InstanceID: inst.ID, Target: remotePath, Error: cmdErr.Error(),
+				})
+				continue
+			}
+			entryRes.CommandID = cmdResp.ID
+			entryRes.CommandStatus = cmdResp.Status
+		}
+
+		res.Results = append(res.Results, entryRes)
+	}
+
+	res.TriggeredCount = len(res.Results)
+	return res, nil
+}
+
+func TriggerArrRescanAction(
+	ctx context.Context,
+	settings config.AppSettings,
+	arrClient *arr.Client,
+	items []ArrRescanItem,
+	dryRun bool,
+) (ArrRescanResult, error) {
+	if err := ensureWritable(settings, dryRun); err != nil {
+		return ArrRescanResult{}, err
+	}
+
+	instancesByID := make(map[string]config.ArrInstanceConfig, len(settings.ArrInstances))
+	for _, inst := range settings.ArrInstances {
+		instancesByID[inst.ID] = inst
+	}
+
+	res := ArrRescanResult{
+		DryRun:  dryRun,
+		Results: make([]ArrRescanEntryResult, 0, len(items)),
+		Errors:  make([]ArrActionError, 0),
+	}
+
+	seen := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		inst, ok := instancesByID[strings.TrimSpace(it.InstanceID)]
+		if !ok {
+			res.Errors = append(res.Errors, ArrActionError{
+				InstanceID: it.InstanceID, Target: it.Title, Error: "Unknown Radarr/Sonarr instance ID.",
+			})
+			continue
+		}
+		if it.ItemID <= 0 {
+			res.Errors = append(res.Errors, ArrActionError{
+				InstanceID: inst.ID, Target: it.Title, Error: "Missing Radarr/Sonarr item ID.",
+			})
+			continue
+		}
+		dedupKey := fmt.Sprintf("%s:%d", inst.ID, it.ItemID)
+		if _, dup := seen[dedupKey]; dup {
+			continue
+		}
+		seen[dedupKey] = struct{}{}
+
+		cmdName := "RefreshMovie"
+		if inst.Type == "sonarr" {
+			cmdName = "RescanSeries"
+		}
+		entry := ArrRescanEntryResult{
+			InstanceID:   inst.ID,
+			InstanceName: inst.Name,
+			AppType:      inst.Type,
+			ItemID:       it.ItemID,
+			Title:        it.Title,
+			CommandName:  cmdName,
+		}
+		if !dryRun {
+			cmdResp, cmdErr := arrClient.TriggerRescan(ctx, inst, it.ItemID)
+			if cmdErr != nil {
+				res.Errors = append(res.Errors, ArrActionError{
+					InstanceID: inst.ID, Target: it.Title, Error: cmdErr.Error(),
+				})
+				continue
+			}
+			entry.CommandID = cmdResp.ID
+			entry.CommandStatus = cmdResp.Status
+		}
+		res.Results = append(res.Results, entry)
+	}
+
+	res.TriggeredCount = len(res.Results)
+	return res, nil
 }

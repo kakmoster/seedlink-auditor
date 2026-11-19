@@ -619,7 +619,7 @@ code {
 .audit-table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 980px;
+  min-width: 1140px;
 }
 
 .audit-table th {
@@ -650,24 +650,28 @@ code {
 }
 
 .col-file {
-  width: 24%;
+  width: 19%;
 }
 
 .col-folders {
-  width: 32%;
+  width: 26%;
 }
 
 .col-qbit {
-  width: 24%;
+  width: 20%;
+}
+
+.col-arr {
+  width: 18%;
 }
 
 .col-reclaim {
-  width: 9%;
+  width: 7%;
   white-space: nowrap;
 }
 
 .col-actions {
-  width: 11%;
+  width: 10%;
   white-space: nowrap;
 }
 
@@ -866,6 +870,57 @@ code {
 .torrent-sub {
   font-size: 0.73rem;
   color: var(--text-muted);
+}
+
+.pill-arr-ok {
+  background: var(--green-soft);
+  color: #4ade80;
+}
+
+.pill-arr-warn {
+  background: var(--amber-soft);
+  color: #fbbf24;
+}
+
+.pill-arr-danger {
+  background: var(--red-soft);
+  color: #f87171;
+}
+
+.pill-arr-muted {
+  background: var(--slate-soft);
+  color: #94a3b8;
+}
+
+.arr-item {
+  font-size: 0.78rem;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  margin-top: 4px;
+}
+
+.arr-item.has-issue {
+  border-color: rgba(245, 158, 11, 0.45);
+  background: rgba(245, 158, 11, 0.06);
+}
+
+.arr-type-badge {
+  font-size: 0.69rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(59, 130, 246, 0.18);
+  color: #93c5fd;
+}
+
+.arr-msg {
+  margin-top: 3px;
+  font-size: 0.74rem;
+  color: #fde68a;
+  word-break: break-word;
 }
 
 .reclaim-bytes {

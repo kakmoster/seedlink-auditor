@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"seedlink-auditor/internal/arr"
 	"seedlink-auditor/internal/config"
 	"seedlink-auditor/internal/qbit"
 )
@@ -69,6 +70,26 @@ type TorrentMatch struct {
 	MatchedRoles  []string `json:"matched_roles"`
 }
 
+type ArrReference struct {
+	InstanceID    string `json:"instance_id"`
+	InstanceName  string `json:"instance_name"`
+	AppType       string `json:"app_type"`
+	ItemID        int    `json:"item_id"`
+	EpisodeIDs    []int  `json:"episode_ids,omitempty"`
+	Title         string `json:"title"`
+	Year          int    `json:"year,omitempty"`
+	SeasonNumber  int    `json:"season_number,omitempty"`
+	EpisodeNumber int    `json:"episode_number,omitempty"`
+	Monitored     bool   `json:"monitored"`
+	HasFile       bool   `json:"has_file"`
+	MatchKind     string `json:"match_kind"`
+	StatusMessage string `json:"status_message,omitempty"`
+	FilePath      string `json:"file_path,omitempty"`
+	RootPath      string `json:"root_path,omitempty"`
+	CanImport     bool   `json:"can_import"`
+	CanRescan     bool   `json:"can_rescan"`
+}
+
 type ComparisonGroup struct {
 	ID                    string         `json:"id"`
 	Filename              string         `json:"filename"`
@@ -79,6 +100,8 @@ type ComparisonGroup struct {
 	SeedingSummary        string         `json:"seeding_summary"`
 	HasTrackerIssue       bool           `json:"has_tracker_issue"`
 	HasUnregistered       bool           `json:"has_unregistered"`
+	ArrSummary            string         `json:"arr_summary"`
+	HasArrIssue           bool           `json:"has_arr_issue"`
 	SoleCopyOnDisk        bool           `json:"sole_copy_on_disk"`
 	ExternalHardlinkCount int            `json:"external_hardlink_count"`
 	CanHardlink           bool           `json:"can_hardlink"`
@@ -89,6 +112,7 @@ type ComparisonGroup struct {
 	FolderBFiles          []ScannedFile  `json:"folder_b_files"`
 	AllPaths              []string       `json:"all_paths"`
 	Torrents              []TorrentMatch `json:"torrents"`
+	ArrMatches            []ArrReference `json:"arr_matches"`
 }
 
 type Summary struct {
@@ -111,6 +135,10 @@ type Summary struct {
 	SeedingCount                  int   `json:"seeding_count"`
 	UnregisteredCount             int   `json:"unregistered_count"`
 	TrackerErrorCount             int   `json:"tracker_error_count"`
+	ArrImportedCount              int   `json:"arr_imported_count"`
+	ArrIssueCount                 int   `json:"arr_issue_count"`
+	ArrWantedNotImportedCount     int   `json:"arr_wanted_not_imported_count"`
+	ArrUnlinkedLibraryCount       int   `json:"arr_unlinked_library_count"`
 	TotalReclaimableBytes         int64 `json:"total_reclaimable_bytes"`
 }
 
@@ -121,6 +149,7 @@ type ScanResult struct {
 	Warnings           []string              `json:"warnings"`
 	Folders            []FolderStat          `json:"folders"`
 	QbitInstances      []qbit.InstanceReport `json:"qbit_instances"`
+	ArrInstances       []arr.InstanceReport  `json:"arr_instances"`
 	Summary            Summary               `json:"summary"`
 	Groups             []ComparisonGroup     `json:"groups"`
 	ReadOnlyMode       bool                  `json:"read_only_mode"`
@@ -383,10 +412,21 @@ func clusterFiles(allFiles []ScannedFile) [][]ScannedFile {
 	return out
 }
 
-func ScanAndCompare(settings config.AppSettings, qbitIndex *qbit.Index) ScanResult {
+func ScanAndCompare(settings config.AppSettings, qbitIndex *qbit.Index, arrIndex *arr.Index) ScanResult {
 	start := time.Now()
 	if qbitIndex == nil {
 		qbitIndex = qbit.NewIndex()
+	}
+	if arrIndex == nil {
+		arrIndex = arr.NewIndex()
+	}
+
+	hasEnabledArr := false
+	for _, a := range settings.ArrInstances {
+		if a.Enabled {
+			hasEnabledArr = true
+			break
+		}
 	}
 
 	ignoreExts := make(map[string]struct{}, len(settings.IgnoreExtensions))
@@ -474,6 +514,11 @@ func ScanAndCompare(settings config.AppSettings, qbitIndex *qbit.Index) ScanResu
 	for _, rep := range qbitIndex.Instances {
 		if !rep.OK && rep.Error != nil && *rep.Error != "Disabled" {
 			warnings = append(warnings, fmt.Sprintf("qBittorrent '%s' error: %s", rep.InstanceName, *rep.Error))
+		}
+	}
+	for _, rep := range arrIndex.Instances {
+		if !rep.OK && rep.Error != nil && *rep.Error != "Disabled" {
+			warnings = append(warnings, fmt.Sprintf("%s '%s' error: %s", strings.ToUpper(rep.AppType[:1])+rep.AppType[1:], rep.InstanceName, *rep.Error))
 		}
 	}
 
@@ -823,6 +868,223 @@ func ScanAndCompare(settings config.AppSettings, qbitIndex *qbit.Index) ScanResu
 			allPaths = append(allPaths, f.AbsPath)
 		}
 
+		// Correlate against Radarr / Sonarr index
+		arrMatches := make([]ArrReference, 0)
+		arrSummary := "UNCONFIGURED"
+		hasArrIssue := false
+
+		if hasEnabledArr {
+			type arrItemKey struct {
+				InstanceID string
+				ItemID     int
+				Kind       string
+			}
+			seenArr := make(map[arrItemKey]struct{})
+			importedInstances := make(map[string]struct{})
+			importedItems := make(map[string]struct{})
+			unlinkedItems := make(map[string]struct{})
+			anyImported := false
+			anyQueueBlocked := false
+			anyWanted := false
+			anyLibraryUnlinked := false
+			anyReplaced := false
+
+			importCandidatePath := repFile.AbsPath
+			if len(inB) > 0 {
+				importCandidatePath = inB[0].AbsPath
+			}
+
+			// 1. Imported file matches
+			for _, f := range groupFiles {
+				for _, fm := range arrIndex.FindFileMatches(f.AbsPath, f.Filename, f.Size) {
+					k := arrItemKey{InstanceID: fm.Entry.InstanceID, ItemID: fm.Entry.ItemID, Kind: "imported"}
+					if _, dup := seenArr[k]; dup {
+						continue
+					}
+					seenArr[k] = struct{}{}
+					importedInstances[fm.Entry.InstanceID] = struct{}{}
+					importedItems[fmt.Sprintf("%s:%d", fm.Entry.InstanceID, fm.Entry.ItemID)] = struct{}{}
+					anyImported = true
+					arrMatches = append(arrMatches, ArrReference{
+						InstanceID:    fm.Entry.InstanceID,
+						InstanceName:  fm.Entry.InstanceName,
+						AppType:       fm.Entry.AppType,
+						ItemID:        fm.Entry.ItemID,
+						Title:         fm.Entry.Title,
+						Year:          fm.Entry.Year,
+						SeasonNumber:  fm.Entry.SeasonNumber,
+						Monitored:     fm.Entry.Monitored,
+						HasFile:       true,
+						MatchKind:     "imported",
+						StatusMessage: "Imported and referenced",
+						FilePath:      fm.Entry.MappedPath,
+					})
+				}
+			}
+
+			// 2. Queue matches (by torrent hash)
+			hashes := make([]string, 0, len(torrents))
+			for _, t := range torrents {
+				hashes = append(hashes, t.TorrentHash)
+			}
+			for _, qm := range arrIndex.FindQueueMatches(hashes) {
+				if qm.ItemID > 0 {
+					if _, alreadyImported := importedItems[fmt.Sprintf("%s:%d", qm.InstanceID, qm.ItemID)]; alreadyImported {
+						continue
+					}
+				}
+				k := arrItemKey{InstanceID: qm.InstanceID, ItemID: qm.ItemID, Kind: "queue"}
+				if _, dup := seenArr[k]; dup {
+					continue
+				}
+				seenArr[k] = struct{}{}
+				msg := qm.StatusMessage
+				if msg == "" {
+					if qm.TrackedDownloadState != "" {
+						msg = qm.TrackedDownloadState
+					} else {
+						msg = qm.Status
+					}
+				}
+				if qm.IsBlocked {
+					anyQueueBlocked = true
+				}
+				arrMatches = append(arrMatches, ArrReference{
+					InstanceID:    qm.InstanceID,
+					InstanceName:  qm.InstanceName,
+					AppType:       qm.AppType,
+					ItemID:        qm.ItemID,
+					Title:         qm.Title,
+					Monitored:     true,
+					HasFile:       false,
+					MatchKind:     "queue",
+					StatusMessage: msg,
+					FilePath:      importCandidatePath,
+					CanImport:     len(inA) == 0 || qm.IsBlocked,
+				})
+			}
+
+			// 3. Unlinked file inside a Radarr/Sonarr library directory (in Folder A, not in Arr file table)
+			for _, f := range inA {
+				for _, lib := range arrIndex.FindLibraryPathOwner(f.AbsPath) {
+					if _, alreadyImported := importedItems[fmt.Sprintf("%s:%d", lib.InstanceID, lib.ItemID)]; alreadyImported {
+						continue
+					}
+					k := arrItemKey{InstanceID: lib.InstanceID, ItemID: lib.ItemID, Kind: "library_unlinked"}
+					if _, dup := seenArr[k]; dup {
+						continue
+					}
+					seenArr[k] = struct{}{}
+					unlinkedItems[fmt.Sprintf("%s:%d", lib.InstanceID, lib.ItemID)] = struct{}{}
+					anyLibraryUnlinked = true
+					arrMatches = append(arrMatches, ArrReference{
+						InstanceID:    lib.InstanceID,
+						InstanceName:  lib.InstanceName,
+						AppType:       lib.AppType,
+						ItemID:        lib.ItemID,
+						Title:         lib.Title,
+						Year:          lib.Year,
+						Monitored:     lib.Monitored,
+						HasFile:       lib.HasFile,
+						MatchKind:     "library_unlinked",
+						StatusMessage: "File sits in library folder but is unlinked in Arr",
+						FilePath:      f.AbsPath,
+						RootPath:      lib.MappedPath,
+						CanRescan:     true,
+					})
+				}
+			}
+
+			// 4. Title / wanted / replaced matches when not yet matched on disk
+			if !anyImported {
+				nameCandidates := make([]string, 0, len(groupFiles))
+				for _, f := range groupFiles {
+					nameCandidates = append(nameCandidates, f.Filename)
+				}
+				torrentNames := make([]string, 0, len(torrents))
+				for _, t := range torrents {
+					torrentNames = append(torrentNames, t.TorrentName)
+				}
+				if len(torrentNames) == 0 {
+					torrentNames = []string{""}
+				}
+				for _, fn := range nameCandidates {
+					for _, tn := range torrentNames {
+						for _, tm := range arrIndex.FindTitleMatches(fn, tn) {
+							itemKey := fmt.Sprintf("%s:%d", tm.InstanceID, tm.ItemID)
+							if _, alreadyImported := importedItems[itemKey]; alreadyImported {
+								continue
+							}
+							if _, alreadyUnlinked := unlinkedItems[itemKey]; alreadyUnlinked {
+								continue
+							}
+							kind := "wanted_title"
+							canImport := true
+							msg := "Wanted/missing in Arr; file not imported to library"
+							if tm.HasFile {
+								kind = "replaced"
+								canImport = false
+								msg = "Arr already has another file for this title"
+							}
+							k := arrItemKey{InstanceID: tm.InstanceID, ItemID: tm.ItemID, Kind: kind}
+							if _, dup := seenArr[k]; dup {
+								continue
+							}
+							seenArr[k] = struct{}{}
+							if tm.HasFile {
+								anyReplaced = true
+							} else {
+								anyWanted = true
+							}
+							arrMatches = append(arrMatches, ArrReference{
+								InstanceID:    tm.InstanceID,
+								InstanceName:  tm.InstanceName,
+								AppType:       tm.AppType,
+								ItemID:        tm.ItemID,
+								EpisodeIDs:    tm.EpisodeIDs,
+								Title:         tm.Title,
+								Year:          tm.Year,
+								SeasonNumber:  tm.SeasonNumber,
+								EpisodeNumber: tm.EpisodeNumber,
+								Monitored:     tm.Monitored,
+								HasFile:       tm.HasFile,
+								MatchKind:     kind,
+								StatusMessage: msg,
+								FilePath:      importCandidatePath,
+								RootPath:      tm.RootPath,
+								CanImport:     canImport,
+							})
+						}
+					}
+				}
+			}
+			_ = importedInstances
+
+			switch {
+			case anyImported:
+				arrSummary = "IMPORTED"
+				summary.ArrImportedCount++
+			case anyQueueBlocked:
+				arrSummary = "IN_QUEUE_BLOCKED"
+				hasArrIssue = true
+				summary.ArrIssueCount++
+			case anyWanted:
+				arrSummary = "WANTED_NOT_IMPORTED"
+				hasArrIssue = true
+				summary.ArrIssueCount++
+				summary.ArrWantedNotImportedCount++
+			case anyLibraryUnlinked:
+				arrSummary = "UNLINKED_IN_LIBRARY"
+				hasArrIssue = true
+				summary.ArrIssueCount++
+				summary.ArrUnlinkedLibraryCount++
+			case anyReplaced:
+				arrSummary = "REPLACED_IN_ARR"
+			default:
+				arrSummary = "NOT_IN_ARR"
+			}
+		}
+
 		groups = append(groups, ComparisonGroup{
 			ID:                    fmt.Sprintf("grp-%d", idx+1),
 			Filename:              repFile.Filename,
@@ -833,6 +1095,8 @@ func ScanAndCompare(settings config.AppSettings, qbitIndex *qbit.Index) ScanResu
 			SeedingSummary:        seedingSummary,
 			HasTrackerIssue:       hasTrackerIssue,
 			HasUnregistered:       anyUnregistered,
+			ArrSummary:            arrSummary,
+			HasArrIssue:           hasArrIssue,
 			SoleCopyOnDisk:        soleCopyOnDisk,
 			ExternalHardlinkCount: externalHardlinkCount,
 			CanHardlink:           canHardlink,
@@ -843,6 +1107,7 @@ func ScanAndCompare(settings config.AppSettings, qbitIndex *qbit.Index) ScanResu
 			FolderBFiles:          inB,
 			AllPaths:              allPaths,
 			Torrents:              torrents,
+			ArrMatches:            arrMatches,
 		})
 	}
 
@@ -879,6 +1144,9 @@ func ScanAndCompare(settings config.AppSettings, qbitIndex *qbit.Index) ScanResu
 	instancesOut := make([]qbit.InstanceReport, len(qbitIndex.Instances))
 	copy(instancesOut, qbitIndex.Instances)
 
+	arrInstancesOut := make([]arr.InstanceReport, len(arrIndex.Instances))
+	copy(arrInstancesOut, arrIndex.Instances)
+
 	return ScanResult{
 		ScannedAt:          float64(time.Now().UnixNano()) / 1e9,
 		DurationMS:         durationMS,
@@ -886,6 +1154,7 @@ func ScanAndCompare(settings config.AppSettings, qbitIndex *qbit.Index) ScanResu
 		Warnings:           warnings,
 		Folders:            folderStats,
 		QbitInstances:      instancesOut,
+		ArrInstances:       arrInstancesOut,
 		Summary:            summary,
 		Groups:             groups,
 		ReadOnlyMode:       settings.ReadOnlyMode,

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"seedlink-auditor/internal/actions"
+	"seedlink-auditor/internal/arr"
 	"seedlink-auditor/internal/config"
 	"seedlink-auditor/internal/qbit"
 	"seedlink-auditor/internal/scanner"
@@ -391,7 +392,7 @@ func setupFixture(t *testing.T) fixtureEnv {
 		t.Fatal(err)
 	}
 
-	srv := server.New(cfgMgr, qbit.NewClient(5*time.Second), nil)
+	srv := server.New(cfgMgr, qbit.NewClient(5*time.Second), arr.NewClient(5*time.Second), nil)
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 
@@ -530,7 +531,7 @@ func TestTrackerErrorAndFallbackEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ts := httptest.NewServer(server.New(cfgMgr, qbit.NewClient(5*time.Second), nil))
+	ts := httptest.NewServer(server.New(cfgMgr, qbit.NewClient(5*time.Second), arr.NewClient(5*time.Second), nil))
 	t.Cleanup(ts.Close)
 
 	var scan scanner.ScanResult
@@ -811,5 +812,514 @@ func TestExportAndBrowseEndpoints(t *testing.T) {
 	}
 	if !foundA {
 		t.Fatalf("expected folder_a in browse response: %+v", browseBody)
+	}
+}
+
+type mockArrServer struct {
+	mu           sync.Mutex
+	commands     []map[string]any
+	server       *httptest.Server
+	movies       []map[string]any
+	series       []map[string]any
+	episodeFiles map[string][]map[string]any
+	wanted       []map[string]any
+	queue        []map[string]any
+	manualItems  []map[string]any
+}
+
+func newMockArrServer(t *testing.T, appType string) *mockArrServer {
+	t.Helper()
+	ma := &mockArrServer{
+		commands:     make([]map[string]any, 0),
+		episodeFiles: make(map[string][]map[string]any),
+	}
+
+	mux := http.NewServeMux()
+	requireKey := func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Header.Get("X-Api-Key") != "arr-secret-key" {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return false
+		}
+		return true
+	}
+
+	mux.HandleFunc("/api/v3/system/status", func(w http.ResponseWriter, r *http.Request) {
+		if !requireKey(w, r) {
+			return
+		}
+		name := "Radarr"
+		ver := "5.10.0"
+		if appType == "sonarr" {
+			name = "Sonarr"
+			ver = "4.0.9"
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"appName": name, "version": ver})
+	})
+
+	mux.HandleFunc("/api/v3/movie", func(w http.ResponseWriter, r *http.Request) {
+		if !requireKey(w, r) {
+			return
+		}
+		ma.mu.Lock()
+		defer ma.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(ma.movies)
+	})
+
+	mux.HandleFunc("/api/v3/series", func(w http.ResponseWriter, r *http.Request) {
+		if !requireKey(w, r) {
+			return
+		}
+		ma.mu.Lock()
+		defer ma.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(ma.series)
+	})
+
+	mux.HandleFunc("/api/v3/episodefile", func(w http.ResponseWriter, r *http.Request) {
+		if !requireKey(w, r) {
+			return
+		}
+		sid := r.URL.Query().Get("seriesId")
+		ma.mu.Lock()
+		files := ma.episodeFiles[sid]
+		ma.mu.Unlock()
+		if files == nil {
+			files = []map[string]any{}
+		}
+		_ = json.NewEncoder(w).Encode(files)
+	})
+
+	mux.HandleFunc("/api/v3/wanted/missing", func(w http.ResponseWriter, r *http.Request) {
+		if !requireKey(w, r) {
+			return
+		}
+		ma.mu.Lock()
+		recs := ma.wanted
+		ma.mu.Unlock()
+		if recs == nil {
+			recs = []map[string]any{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"page":         1,
+			"pageSize":     1000,
+			"totalRecords": len(recs),
+			"records":      recs,
+		})
+	})
+
+	mux.HandleFunc("/api/v3/queue", func(w http.ResponseWriter, r *http.Request) {
+		if !requireKey(w, r) {
+			return
+		}
+		ma.mu.Lock()
+		recs := ma.queue
+		ma.mu.Unlock()
+		if recs == nil {
+			recs = []map[string]any{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"page":         1,
+			"pageSize":     1000,
+			"totalRecords": len(recs),
+			"records":      recs,
+		})
+	})
+
+	mux.HandleFunc("/api/v3/manualimport", func(w http.ResponseWriter, r *http.Request) {
+		if !requireKey(w, r) {
+			return
+		}
+		ma.mu.Lock()
+		items := ma.manualItems
+		ma.mu.Unlock()
+		if items == nil {
+			items = []map[string]any{}
+		}
+		_ = json.NewEncoder(w).Encode(items)
+	})
+
+	mux.HandleFunc("/api/v3/command", func(w http.ResponseWriter, r *http.Request) {
+		if !requireKey(w, r) {
+			return
+		}
+		var cmd map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ma.mu.Lock()
+		ma.commands = append(ma.commands, cmd)
+		cmdID := len(ma.commands)
+		ma.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":     cmdID,
+			"name":   cmd["name"],
+			"status": "queued",
+		})
+	})
+
+	ma.server = httptest.NewServer(mux)
+	t.Cleanup(ma.server.Close)
+	return ma
+}
+
+func TestRadarrAndSonarrIntegration(t *testing.T) {
+	root := t.TempDir()
+	plexDir := filepath.Join(root, "plex")
+	dlDir := filepath.Join(root, "downloads")
+
+	// 1. Healthy Radarr movie (hardlinked Plex <-> Downloads)
+	impSize := 64 * 1024
+	impPlex := filepath.Join(plexDir, "movies", "Inception (2010)", "Inception (2010).mkv")
+	impDl := filepath.Join(dlDir, "movies", "Inception.2010.1080p.mkv")
+	writeTestFile(t, impPlex, makePayload("inception", impSize))
+	if err := os.MkdirAll(filepath.Dir(impDl), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(impPlex, impDl); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Healthy Sonarr episode (hardlinked Plex <-> Downloads)
+	epSize := 48 * 1024
+	epPlex := filepath.Join(plexDir, "tv", "Severance", "Season 01", "Severance - S01E01.mkv")
+	epDl := filepath.Join(dlDir, "tv", "Severance.S01E01.1080p.mkv")
+	writeTestFile(t, epPlex, makePayload("sev1", epSize))
+	if err := os.MkdirAll(filepath.Dir(epDl), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(epPlex, epDl); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Wanted Radarr movie stuck in Downloads + qBit (NOT in Plex)
+	wantedSize := 80 * 1024
+	wantedDl := filepath.Join(dlDir, "movies", "The.Matrix.1999.2160p.mkv")
+	writeTestFile(t, wantedDl, makePayload("matrix", wantedSize))
+
+	// 4. Queue-blocked Radarr movie in Downloads + qBit
+	blockedSize := 72 * 1024
+	blockedDl := filepath.Join(dlDir, "movies", "Heat.1995.BluRay.mkv")
+	writeTestFile(t, blockedDl, makePayload("heat", blockedSize))
+
+	// 5. Unlinked movie file sitting inside Radarr's movie directory in Plex, but hasFile=false in Radarr
+	unlinkedSize := 56 * 1024
+	unlinkedPlex := filepath.Join(plexDir, "movies", "Memento (2000)", "Memento (2000).mkv")
+	writeTestFile(t, unlinkedPlex, makePayload("memento", unlinkedSize))
+
+	// 6. Replaced/upgraded orphaned download in Downloads (Radarr already has another file for Blade Runner 2049)
+	replacedSize := 60 * 1024
+	replacedDl := filepath.Join(dlDir, "movies", "Blade.Runner.2049.2017.720p.mkv")
+	writeTestFile(t, replacedDl, makePayload("br2049", replacedSize))
+
+	// 7. Wanted Sonarr episode in Downloads (NOT in Plex)
+	wantedEpSize := 40 * 1024
+	wantedEpDl := filepath.Join(dlDir, "tv", "Severance.S01E02.1080p.mkv")
+	writeTestFile(t, wantedEpDl, makePayload("sev2", wantedEpSize))
+
+	mq := newMockQbitServer(t, []mockTorrent{
+		{
+			Hash:     "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+			Name:     "The.Matrix.1999.2160p",
+			SavePath: qbit.NormalizeSlashPath(dlDir),
+			State:    "uploading",
+			Ratio:    1.4,
+			Tracker:  "https://tracker.org/announce",
+			Trackers: []mockTracker{{URL: "https://tracker.org/announce", Status: 2}},
+			Files: []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+			}{{Name: "movies/The.Matrix.1999.2160p.mkv", Size: int64(wantedSize)}},
+		},
+		{
+			Hash:     "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
+			Name:     "Heat.1995.BluRay",
+			SavePath: qbit.NormalizeSlashPath(dlDir),
+			State:    "stalledUP",
+			Ratio:    0.5,
+			Tracker:  "https://tracker.org/announce",
+			Trackers: []mockTracker{{URL: "https://tracker.org/announce", Status: 2}},
+			Files: []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+			}{{Name: "movies/Heat.1995.BluRay.mkv", Size: int64(blockedSize)}},
+		},
+	})
+
+	radarrMock := newMockArrServer(t, "radarr")
+	radarrMock.movies = []map[string]any{
+		{
+			"id":        10,
+			"title":     "Inception",
+			"year":      2010,
+			"path":      "/media/movies/Inception (2010)",
+			"hasFile":   true,
+			"monitored": true,
+			"movieFile": map[string]any{
+				"id":           101,
+				"path":         "/media/movies/Inception (2010)/Inception (2010).mkv",
+				"relativePath": "Inception (2010).mkv",
+				"size":         impSize,
+			},
+		},
+		{
+			"id":        20,
+			"title":     "The Matrix",
+			"year":      1999,
+			"path":      "/media/movies/The Matrix (1999)",
+			"hasFile":   false,
+			"monitored": true,
+		},
+		{
+			"id":        30,
+			"title":     "Heat",
+			"year":      1995,
+			"path":      "/media/movies/Heat (1995)",
+			"hasFile":   false,
+			"monitored": true,
+		},
+		{
+			"id":        40,
+			"title":     "Memento",
+			"year":      2000,
+			"path":      "/media/movies/Memento (2000)",
+			"hasFile":   false,
+			"monitored": true,
+		},
+		{
+			"id":        50,
+			"title":     "Blade Runner 2049",
+			"year":      2017,
+			"path":      "/media/movies/Blade Runner 2049 (2017)",
+			"hasFile":   true,
+			"monitored": true,
+			"movieFile": map[string]any{
+				"id":           501,
+				"path":         "/media/movies/Blade Runner 2049 (2017)/Blade Runner 2049 (2017) 2160p.mkv",
+				"relativePath": "Blade Runner 2049 (2017) 2160p.mkv",
+				"size":         999999,
+			},
+		},
+	}
+	radarrMock.queue = []map[string]any{
+		{
+			"id":                    901,
+			"movieId":               30,
+			"title":                 "Heat.1995.BluRay",
+			"status":                "completed",
+			"trackedDownloadStatus": "warning",
+			"trackedDownloadState":  "importBlocked",
+			"downloadId":            "BBBB2222BBBB2222BBBB2222BBBB2222BBBB2222",
+			"errorMessage":          "Sample file or upgrade blocked",
+		},
+	}
+	radarrMock.manualItems = []map[string]any{
+		{
+			"id":         1,
+			"path":       "/arr_downloads/movies/The.Matrix.1999.2160p.mkv",
+			"name":       "The.Matrix.1999.2160p.mkv",
+			"size":       wantedSize,
+			"movie":      map[string]any{"id": 20, "title": "The Matrix", "year": 1999},
+			"quality":    map[string]any{"quality": map[string]any{"id": 19, "name": "Bluray-2160p"}},
+			"languages":  []map[string]any{{"id": 1, "name": "English"}},
+			"rejections": []map[string]any{{"reason": "Not an upgrade", "type": "permanent"}},
+		},
+	}
+
+	sonarrMock := newMockArrServer(t, "sonarr")
+	sonarrMock.series = []map[string]any{
+		{
+			"id":        70,
+			"title":     "Severance",
+			"year":      2022,
+			"path":      "/media/tv/Severance",
+			"monitored": true,
+		},
+	}
+	sonarrMock.episodeFiles["70"] = []map[string]any{
+		{
+			"id":           701,
+			"seriesId":     70,
+			"seasonNumber": 1,
+			"path":         "/media/tv/Severance/Season 01/Severance - S01E01.mkv",
+			"relativePath": "Season 01/Severance - S01E01.mkv",
+			"size":         epSize,
+		},
+	}
+	sonarrMock.wanted = []map[string]any{
+		{
+			"id":            7002,
+			"seriesId":      70,
+			"seasonNumber":  1,
+			"episodeNumber": 2,
+			"title":         "Half Loop",
+			"monitored":     true,
+			"hasFile":       false,
+		},
+	}
+
+	cfgMgr, err := config.NewManager(filepath.Join(root, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cfgMgr.Update(config.AppSettings{
+		ReadOnlyMode: true,
+		Folders: []config.FolderConfig{
+			{ID: "plex", Label: "Plex", Path: plexDir, Role: "primary"},
+			{ID: "dl", Label: "Downloads", Path: dlDir, Role: "secondary"},
+		},
+		QbitInstances: []config.QbitInstanceConfig{
+			{ID: "q1", Name: "qBit", URL: mq.server.URL, Username: "admin", Password: "secret", Enabled: true},
+		},
+		ArrInstances: []config.ArrInstanceConfig{
+			{
+				ID:      "rad1",
+				Name:    "Radarr",
+				Type:    "radarr",
+				URL:     radarrMock.server.URL,
+				APIKey:  "arr-secret-key",
+				Enabled: true,
+				PathMappings: []config.PathMapping{
+					{RemotePrefix: "/media", LocalPrefix: qbit.NormalizeSlashPath(plexDir)},
+					{RemotePrefix: "/arr_downloads", LocalPrefix: qbit.NormalizeSlashPath(dlDir)},
+				},
+			},
+			{
+				ID:      "son1",
+				Name:    "Sonarr",
+				Type:    "sonarr",
+				URL:     sonarrMock.server.URL,
+				APIKey:  "arr-secret-key",
+				Enabled: true,
+				PathMappings: []config.PathMapping{
+					{RemotePrefix: "/media", LocalPrefix: qbit.NormalizeSlashPath(plexDir)},
+					{RemotePrefix: "/arr_downloads", LocalPrefix: qbit.NormalizeSlashPath(dlDir)},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(server.New(cfgMgr, qbit.NewClient(5*time.Second), arr.NewClient(5*time.Second), nil))
+	t.Cleanup(ts.Close)
+
+	// 1. Test /api/arr/test (valid and invalid key)
+	var testOK arr.TestResult
+	code := apiDoJSON(t, ts, http.MethodPost, "/api/arr/test", config.ArrInstanceConfig{
+		ID: "rad1", Name: "Radarr", Type: "radarr", URL: radarrMock.server.URL, APIKey: "arr-secret-key", Enabled: true,
+	}, &testOK)
+	if code != http.StatusOK || !testOK.OK || testOK.AppName != "Radarr" || testOK.ItemCount != 5 {
+		t.Fatalf("unexpected /api/arr/test valid response: code=%d res=%+v", code, testOK)
+	}
+
+	var testBad arr.TestResult
+	code = apiDoJSON(t, ts, http.MethodPost, "/api/arr/test", config.ArrInstanceConfig{
+		ID: "rad1", Name: "Radarr", Type: "radarr", URL: radarrMock.server.URL, APIKey: "wrong", Enabled: true,
+	}, &testBad)
+	if code != http.StatusOK || testBad.OK {
+		t.Fatalf("expected failed /api/arr/test on invalid key, got code=%d res=%+v", code, testBad)
+	}
+
+	// 2. Scan and verify all ArrSummary states
+	var scan scanner.ScanResult
+	if code := apiDoJSON(t, ts, http.MethodPost, "/api/scan", nil, &scan); code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/scan, got %d", code)
+	}
+
+	byName := make(map[string]scanner.ComparisonGroup)
+	for _, g := range scan.Groups {
+		byName[g.Filename] = g
+	}
+
+	if byName["Inception (2010).mkv"].ArrSummary != "IMPORTED" {
+		t.Fatalf("expected Inception to be IMPORTED, got %+v", byName["Inception (2010).mkv"])
+	}
+	if byName["Severance - S01E01.mkv"].ArrSummary != "IMPORTED" {
+		t.Fatalf("expected Severance S01E01 to be IMPORTED, got %+v", byName["Severance - S01E01.mkv"])
+	}
+	matrixGrp := byName["The.Matrix.1999.2160p.mkv"]
+	if matrixGrp.ArrSummary != "WANTED_NOT_IMPORTED" || !matrixGrp.HasArrIssue || len(matrixGrp.ArrMatches) == 0 || !matrixGrp.ArrMatches[0].CanImport {
+		t.Fatalf("expected Matrix to be WANTED_NOT_IMPORTED with CanImport=true, got %+v", matrixGrp)
+	}
+	if byName["Heat.1995.BluRay.mkv"].ArrSummary != "IN_QUEUE_BLOCKED" || !byName["Heat.1995.BluRay.mkv"].HasArrIssue {
+		t.Fatalf("expected Heat to be IN_QUEUE_BLOCKED, got %+v", byName["Heat.1995.BluRay.mkv"])
+	}
+	mementoGrp := byName["Memento (2000).mkv"]
+	if mementoGrp.ArrSummary != "UNLINKED_IN_LIBRARY" || !mementoGrp.HasArrIssue || len(mementoGrp.ArrMatches) == 0 || !mementoGrp.ArrMatches[0].CanRescan {
+		t.Fatalf("expected Memento to be UNLINKED_IN_LIBRARY with CanRescan=true, got %+v", mementoGrp)
+	}
+	if byName["Blade.Runner.2049.2017.720p.mkv"].ArrSummary != "REPLACED_IN_ARR" {
+		t.Fatalf("expected Blade Runner 2049 to be REPLACED_IN_ARR, got %+v", byName["Blade.Runner.2049.2017.720p.mkv"])
+	}
+	if byName["Severance.S01E02.1080p.mkv"].ArrSummary != "WANTED_NOT_IMPORTED" {
+		t.Fatalf("expected Severance S01E02 to be WANTED_NOT_IMPORTED, got %+v", byName["Severance.S01E02.1080p.mkv"])
+	}
+
+	// 3. Verify Read-Only Mode blocks arr-import & arr-rescan (403) while dry_run=true returns 200
+	importPayload := map[string]any{
+		"items": []map[string]any{{
+			"instance_id":        "rad1",
+			"local_path":         wantedDl,
+			"download_client_id": "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+			"item_id":            20,
+		}},
+		"force_manual_import": false,
+		"dry_run":             true,
+	}
+	var dryImp actions.ArrImportResult
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/actions/arr-import", importPayload, &dryImp); c != http.StatusOK || dryImp.TriggeredCount != 1 {
+		t.Fatalf("expected dry_run arr-import to succeed, got code=%d res=%+v", c, dryImp)
+	}
+	if len(dryImp.Results[0].Rejections) != 1 || dryImp.Results[0].Rejections[0] != "Not an upgrade" {
+		t.Fatalf("expected manualimport preview rejection to be surfaced, got %+v", dryImp.Results[0])
+	}
+
+	importPayload["dry_run"] = false
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/actions/arr-import", importPayload, nil); c != http.StatusForbidden {
+		t.Fatalf("expected 403 for arr-import in read-only mode, got %d", c)
+	}
+
+	rescanPayload := map[string]any{
+		"items":   []map[string]any{{"instance_id": "rad1", "item_id": 40, "title": "Memento"}},
+		"dry_run": false,
+	}
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/actions/arr-rescan", rescanPayload, nil); c != http.StatusForbidden {
+		t.Fatalf("expected 403 for arr-rescan in read-only mode, got %d", c)
+	}
+
+	// 4. Unlock write mode and execute DownloadedMoviesScan, ManualImport, and RefreshMovie
+	apiDoJSON(t, ts, http.MethodPatch, "/api/config/read-only", map[string]bool{"read_only_mode": false}, nil)
+
+	var execImp actions.ArrImportResult
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/actions/arr-import", importPayload, &execImp); c != http.StatusOK || execImp.TriggeredCount != 1 {
+		t.Fatalf("expected arr-import execution to succeed, got code=%d res=%+v", c, execImp)
+	}
+
+	importPayload["force_manual_import"] = true
+	var execManual actions.ArrImportResult
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/actions/arr-import", importPayload, &execManual); c != http.StatusOK || execManual.TriggeredCount != 1 {
+		t.Fatalf("expected force manual arr-import execution to succeed, got code=%d res=%+v", c, execManual)
+	}
+
+	var execRescan actions.ArrRescanResult
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/actions/arr-rescan", rescanPayload, &execRescan); c != http.StatusOK || execRescan.TriggeredCount != 1 {
+		t.Fatalf("expected arr-rescan execution to succeed, got code=%d res=%+v", c, execRescan)
+	}
+
+	radarrMock.mu.Lock()
+	cmds := append([]map[string]any(nil), radarrMock.commands...)
+	radarrMock.mu.Unlock()
+	if len(cmds) != 3 {
+		t.Fatalf("expected 3 Radarr commands received, got %d: %+v", len(cmds), cmds)
+	}
+	if cmds[0]["name"] != "DownloadedMoviesScan" || cmds[0]["path"] != "/arr_downloads/movies/The.Matrix.1999.2160p.mkv" || cmds[0]["importMode"] != "Auto" {
+		t.Fatalf("unexpected DownloadedMoviesScan payload: %+v", cmds[0])
+	}
+	if cmds[1]["name"] != "ManualImport" || cmds[1]["importMode"] != "auto" {
+		t.Fatalf("unexpected ManualImport payload: %+v", cmds[1])
+	}
+	if cmds[2]["name"] != "RefreshMovie" {
+		t.Fatalf("unexpected RefreshMovie payload: %+v", cmds[2])
 	}
 }

@@ -17,7 +17,8 @@ SeedLink Auditor inspects physical inode / file index metadata (`device`, `inode
   - `DUPLICATE_COPY`: Same filename and byte size across folders on separate inodes — convertible to hardlinks with SHA-256 head/mid/tail content verification.
   - `ORPHANED_IN_B`: Present only in Folder B+ after the original in Folder A was removed, showing whether it is the sole copy on disk (`nlink == 1`) or still referenced externally.
   - `ONLY_IN_A` and `SAME_NAME_DIFF_SIZE`.
-- **Multi-Instance qBittorrent Correlation**: Connects concurrently to one or more qBittorrent WebUI v2 instances with container path-mapping support (`remote_prefix -> local_prefix`), reporting instance, torrent name, tracker, ratio, and seeding state.
+- **Multi-Instance qBittorrent Correlation**: Connects concurrently to one or more qBittorrent WebUI v2 instances with container path-mapping support (`remote_prefix -> local_prefix`), reporting instance, torrent name, tracker, ratio, seeding state, and unregistered/tracker errors.
+- **Radarr & Sonarr v3 Integration**: Checks whether files are imported and referenced in Radarr/Sonarr, detects wanted releases stuck in download folders or blocked in the queue, flags unlinked files inside library folders, and lets you trigger `DownloadedMoviesScan`/`DownloadedEpisodesScan`, `ManualImport`, or `RefreshMovie`/`RescanSeries` directly after a dry-run preview.
 - **Safe Read-Only Mode & Dry-Run Previews**: Starts in Read-Only Mode (`HTTP 403` protection against accidental modifications). Every action supports dry-run previews before execution.
 - **CSV & JSON Exports**: Download full audit reports anytime via `/api/export?format=csv` or `format=json`.
 
@@ -54,11 +55,11 @@ docker run -d \
   ghcr.io/kakmoster/seedlink-auditor:latest
 ```
 
-### Configuring qBittorrent Path Mappings
+### Configuring Path Mappings (qBittorrent, Radarr & Sonarr)
 
-If your qBittorrent instance reports paths like `/downloads/Movie/movie.mkv` while SeedLink Auditor accesses the same directory at `/data/torrents/Movie/movie.mkv`, add a **Path Mapping** in Settings for that qBittorrent instance:
-- **qBit prefix**: `/downloads`
-- **Local prefix**: `/data/torrents`
+If your qBittorrent, Radarr, or Sonarr container reports paths like `/downloads/Movie/movie.mkv` or `/movies/...` while SeedLink Auditor accesses those directories under `/data/...`, add **Path Mappings** in Settings for each instance:
+- **Remote prefix**: `/downloads` (or `/movies`)
+- **Local prefix**: `/data/torrents` (or `/data/media/movies`)
 
 ---
 

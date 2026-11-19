@@ -17,6 +17,7 @@ import (
 	"sync"
 
 	"seedlink-auditor/internal/actions"
+	"seedlink-auditor/internal/arr"
 	"seedlink-auditor/internal/config"
 	"seedlink-auditor/internal/qbit"
 	"seedlink-auditor/internal/scanner"
@@ -25,6 +26,7 @@ import (
 type Server struct {
 	cfgMgr     *config.Manager
 	qbitClient *qbit.Client
+	arrClient  *arr.Client
 	webFS      fs.FS
 	mux        *http.ServeMux
 
@@ -32,10 +34,11 @@ type Server struct {
 	lastScan *scanner.ScanResult
 }
 
-func New(cfgMgr *config.Manager, qbitClient *qbit.Client, webFS fs.FS) *Server {
+func New(cfgMgr *config.Manager, qbitClient *qbit.Client, arrClient *arr.Client, webFS fs.FS) *Server {
 	s := &Server{
 		cfgMgr:     cfgMgr,
 		qbitClient: qbitClient,
+		arrClient:  arrClient,
 		webFS:      webFS,
 		mux:        http.NewServeMux(),
 	}
@@ -53,11 +56,14 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PUT /api/config", s.handlePutConfig)
 	s.mux.HandleFunc("PATCH /api/config/read-only", s.handleToggleReadOnly)
 	s.mux.HandleFunc("POST /api/qbit/test", s.handleTestQbit)
+	s.mux.HandleFunc("POST /api/arr/test", s.handleTestArr)
 	s.mux.HandleFunc("GET /api/fs/browse", s.handleBrowseFS)
 	s.mux.HandleFunc("POST /api/scan", s.handleScan)
 	s.mux.HandleFunc("POST /api/actions/convert-hardlinks", s.handleConvertHardlinks)
 	s.mux.HandleFunc("POST /api/actions/delete-torrents", s.handleDeleteTorrents)
 	s.mux.HandleFunc("POST /api/actions/delete-files", s.handleDeleteFiles)
+	s.mux.HandleFunc("POST /api/actions/arr-import", s.handleArrImport)
+	s.mux.HandleFunc("POST /api/actions/arr-rescan", s.handleArrRescan)
 	s.mux.HandleFunc("GET /api/export", s.handleExport)
 
 	if s.webFS != nil {
@@ -145,6 +151,16 @@ func (s *Server) handleTestQbit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+func (s *Server) handleTestArr(w http.ResponseWriter, r *http.Request) {
+	var inst config.ArrInstanceConfig
+	if err := decodeJSONBody(w, r, &inst); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON payload: %v", err))
+		return
+	}
+	res := s.arrClient.TestConnection(r.Context(), inst)
+	writeJSON(w, http.StatusOK, res)
+}
+
 type dirEntryDTO struct {
 	Name string `json:"name"`
 	Path string `json:"path"`
@@ -229,8 +245,24 @@ func (s *Server) handleBrowseFS(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) runAndStoreScan(r *http.Request) scanner.ScanResult {
 	settings := s.cfgMgr.Get()
-	idx := s.qbitClient.BuildIndex(r.Context(), settings.QbitInstances)
-	result := scanner.ScanAndCompare(settings, idx)
+	var qbitIdx *qbit.Index
+	var arrIdx *arr.Index
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		qbitIdx = s.qbitClient.BuildIndex(r.Context(), settings.QbitInstances)
+	}()
+	go func() {
+		defer wg.Done()
+		if s.arrClient != nil {
+			arrIdx = s.arrClient.BuildIndex(r.Context(), settings.ArrInstances)
+		}
+	}()
+	wg.Wait()
+
+	result := scanner.ScanAndCompare(settings, qbitIdx, arrIdx)
 
 	s.scanMu.Lock()
 	copied := result
@@ -321,6 +353,51 @@ func (s *Server) handleDeleteFiles(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+func (s *Server) handleArrImport(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		Items             []actions.ArrImportItem `json:"items"`
+		ForceManualImport bool                    `json:"force_manual_import"`
+		DryRun            bool                    `json:"dry_run"`
+	}
+	if err := decodeJSONBody(w, r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON payload: %v", err))
+		return
+	}
+
+	res, err := actions.TriggerArrImportAction(r.Context(), s.cfgMgr.Get(), s.arrClient, payload.Items, payload.ForceManualImport, payload.DryRun)
+	if err != nil {
+		if errors.Is(err, actions.ErrReadOnlyMode) {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleArrRescan(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		Items  []actions.ArrRescanItem `json:"items"`
+		DryRun bool                    `json:"dry_run"`
+	}
+	if err := decodeJSONBody(w, r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON payload: %v", err))
+		return
+	}
+
+	res, err := actions.TriggerArrRescanAction(r.Context(), s.cfgMgr.Get(), s.arrClient, payload.Items, payload.DryRun)
+	if err != nil {
+		if errors.Is(err, actions.ErrReadOnlyMode) {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
 	if format == "" {
@@ -364,6 +441,8 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		"FolderBInodes",
 		"Torrents",
 		"Trackers",
+		"ArrSummary",
+		"ArrMatches",
 	})
 
 	for _, grp := range scanRes.Groups {
@@ -402,6 +481,11 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		}
 		sort.Strings(trackers)
 
+		arrDescs := make([]string, 0, len(grp.ArrMatches))
+		for _, m := range grp.ArrMatches {
+			arrDescs = append(arrDescs, fmt.Sprintf("%s (%s): %s [%s]", m.InstanceName, m.AppType, m.Title, m.MatchKind))
+		}
+
 		_ = cw.Write([]string{
 			grp.Status,
 			grp.Filename,
@@ -418,6 +502,8 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 			strings.Join(bInodes, " | "),
 			strings.Join(torrents, " | "),
 			strings.Join(trackers, " | "),
+			grp.ArrSummary,
+			strings.Join(arrDescs, " | "),
 		})
 	}
 	cw.Flush()

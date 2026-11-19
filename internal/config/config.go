@@ -35,10 +35,21 @@ type QbitInstanceConfig struct {
 	PathMappings []PathMapping `json:"path_mappings"`
 }
 
+type ArrInstanceConfig struct {
+	ID           string        `json:"id"`
+	Name         string        `json:"name"`
+	Type         string        `json:"type"` // "radarr" or "sonarr"
+	URL          string        `json:"url"`
+	APIKey       string        `json:"api_key"`
+	Enabled      bool          `json:"enabled"`
+	PathMappings []PathMapping `json:"path_mappings"`
+}
+
 type AppSettings struct {
 	ReadOnlyMode     bool                 `json:"read_only_mode"`
 	Folders          []FolderConfig       `json:"folders"`
 	QbitInstances    []QbitInstanceConfig `json:"qbit_instances"`
+	ArrInstances     []ArrInstanceConfig  `json:"arr_instances"`
 	IgnoreExtensions []string             `json:"ignore_extensions"`
 	MinSizeBytes     int64                `json:"min_size_bytes"`
 }
@@ -62,9 +73,23 @@ func defaultSettings() AppSettings {
 		ReadOnlyMode:     true,
 		Folders:          []FolderConfig{},
 		QbitInstances:    []QbitInstanceConfig{},
+		ArrInstances:     []ArrInstanceConfig{},
 		IgnoreExtensions: []string{},
 		MinSizeBytes:     0,
 	}
+}
+
+func normalizePathMappings(in []PathMapping) []PathMapping {
+	mappings := make([]PathMapping, 0, len(in))
+	for _, m := range in {
+		rp := strings.TrimSpace(m.RemotePrefix)
+		lp := strings.TrimSpace(m.LocalPrefix)
+		if rp == "" || lp == "" {
+			continue
+		}
+		mappings = append(mappings, PathMapping{RemotePrefix: rp, LocalPrefix: lp})
+	}
+	return mappings
 }
 
 func normalizeSettings(in AppSettings) (AppSettings, error) {
@@ -72,6 +97,7 @@ func normalizeSettings(in AppSettings) (AppSettings, error) {
 		ReadOnlyMode:     in.ReadOnlyMode,
 		Folders:          make([]FolderConfig, 0, len(in.Folders)),
 		QbitInstances:    make([]QbitInstanceConfig, 0, len(in.QbitInstances)),
+		ArrInstances:     make([]ArrInstanceConfig, 0, len(in.ArrInstances)),
 		IgnoreExtensions: make([]string, 0, len(in.IgnoreExtensions)),
 		MinSizeBytes:     in.MinSizeBytes,
 	}
@@ -117,15 +143,6 @@ func normalizeSettings(in AppSettings) (AppSettings, error) {
 		if id == "" {
 			id = randomID()
 		}
-		mappings := make([]PathMapping, 0, len(q.PathMappings))
-		for _, m := range q.PathMappings {
-			rp := strings.TrimSpace(m.RemotePrefix)
-			lp := strings.TrimSpace(m.LocalPrefix)
-			if rp == "" || lp == "" {
-				continue
-			}
-			mappings = append(mappings, PathMapping{RemotePrefix: rp, LocalPrefix: lp})
-		}
 		out.QbitInstances = append(out.QbitInstances, QbitInstanceConfig{
 			ID:           id,
 			Name:         name,
@@ -133,7 +150,32 @@ func normalizeSettings(in AppSettings) (AppSettings, error) {
 			Username:     q.Username,
 			Password:     q.Password,
 			Enabled:      q.Enabled,
-			PathMappings: mappings,
+			PathMappings: normalizePathMappings(q.PathMappings),
+		})
+	}
+
+	for _, a := range in.ArrInstances {
+		name := strings.TrimSpace(a.Name)
+		u := strings.TrimRight(strings.TrimSpace(a.URL), "/")
+		appType := strings.ToLower(strings.TrimSpace(a.Type))
+		if name == "" || u == "" {
+			return AppSettings{}, errors.New("each Radarr/Sonarr instance requires a non-empty name and url")
+		}
+		if appType != "radarr" && appType != "sonarr" {
+			return AppSettings{}, errors.New("each Radarr/Sonarr instance type must be 'radarr' or 'sonarr'")
+		}
+		id := strings.TrimSpace(a.ID)
+		if id == "" {
+			id = randomID()
+		}
+		out.ArrInstances = append(out.ArrInstances, ArrInstanceConfig{
+			ID:           id,
+			Name:         name,
+			Type:         appType,
+			URL:          u,
+			APIKey:       strings.TrimSpace(a.APIKey),
+			Enabled:      a.Enabled,
+			PathMappings: normalizePathMappings(a.PathMappings),
 		})
 	}
 
@@ -161,6 +203,7 @@ func cloneSettings(s AppSettings) AppSettings {
 		ReadOnlyMode:     s.ReadOnlyMode,
 		Folders:          make([]FolderConfig, len(s.Folders)),
 		QbitInstances:    make([]QbitInstanceConfig, len(s.QbitInstances)),
+		ArrInstances:     make([]ArrInstanceConfig, len(s.ArrInstances)),
 		IgnoreExtensions: make([]string, len(s.IgnoreExtensions)),
 		MinSizeBytes:     s.MinSizeBytes,
 	}
@@ -171,6 +214,12 @@ func cloneSettings(s AppSettings) AppSettings {
 		qc.PathMappings = make([]PathMapping, len(q.PathMappings))
 		copy(qc.PathMappings, q.PathMappings)
 		out.QbitInstances[i] = qc
+	}
+	for i, a := range s.ArrInstances {
+		ac := a
+		ac.PathMappings = make([]PathMapping, len(a.PathMappings))
+		copy(ac.PathMappings, a.PathMappings)
+		out.ArrInstances[i] = ac
 	}
 	return out
 }

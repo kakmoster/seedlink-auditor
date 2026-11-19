@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"seedlink-auditor/internal/arr"
 	"seedlink-auditor/internal/config"
 	"seedlink-auditor/internal/qbit"
 	"seedlink-auditor/internal/server"
@@ -29,7 +30,8 @@ func main() {
 	}
 
 	qbitClient := qbit.NewClient(20 * time.Second)
-	srv := server.New(cfgMgr, qbitClient, webFS)
+	arrClient := arr.NewClient(20 * time.Second)
+	srv := server.New(cfgMgr, qbitClient, arrClient, webFS)
 
 	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
