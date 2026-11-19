@@ -273,7 +273,7 @@
             (t) => `${t.torrent_name} ${t.tracker_host} ${t.instance_name} ${t.tracker_health || ""} ${t.tracker_msg || ""}`
           ),
           ...(grp.arr_matches || []).map(
-            (m) => `${m.instance_name} ${m.app_type} ${m.title} ${m.status_message || ""}`
+            (m) => `${m.instance_name} ${m.app_type} ${m.title} ${m.status_message || ""} ${m.existing_file_name || ""}`
           ),
         ]
           .join(" ")
@@ -463,7 +463,13 @@
                       <span class="nlink-badge">${monLabel}</span>
                     </div>
                     <div class="torrent-name">${escapeHtml(renderArrTitle(m))}</div>
-                    ${m.status_message ? `<div class="${isIssue ? "arr-msg" : "torrent-sub"}">${escapeHtml(m.status_message)}</div>` : ""}
+                    ${
+                      m.existing_file_name
+                        ? `<div class="torrent-sub">Arr already has another file:</div><div class="arr-existing-file" title="${escapeHtml(m.existing_file_path || m.existing_file_name)}">${escapeHtml(m.existing_file_name)}</div>`
+                        : m.status_message
+                          ? `<div class="${isIssue ? "arr-msg" : "torrent-sub"}">${escapeHtml(m.status_message)}</div>`
+                          : ""
+                    }
                   </div>`;
                   })
                   .join("");

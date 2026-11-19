@@ -73,23 +73,25 @@ type TorrentMatch struct {
 }
 
 type ArrReference struct {
-	InstanceID    string `json:"instance_id"`
-	InstanceName  string `json:"instance_name"`
-	AppType       string `json:"app_type"`
-	ItemID        int    `json:"item_id"`
-	EpisodeIDs    []int  `json:"episode_ids,omitempty"`
-	Title         string `json:"title"`
-	Year          int    `json:"year,omitempty"`
-	SeasonNumber  int    `json:"season_number,omitempty"`
-	EpisodeNumber int    `json:"episode_number,omitempty"`
-	Monitored     bool   `json:"monitored"`
-	HasFile       bool   `json:"has_file"`
-	MatchKind     string `json:"match_kind"`
-	StatusMessage string `json:"status_message,omitempty"`
-	FilePath      string `json:"file_path,omitempty"`
-	RootPath      string `json:"root_path,omitempty"`
-	CanImport     bool   `json:"can_import"`
-	CanRescan     bool   `json:"can_rescan"`
+	InstanceID       string `json:"instance_id"`
+	InstanceName     string `json:"instance_name"`
+	AppType          string `json:"app_type"`
+	ItemID           int    `json:"item_id"`
+	EpisodeIDs       []int  `json:"episode_ids,omitempty"`
+	Title            string `json:"title"`
+	Year             int    `json:"year,omitempty"`
+	SeasonNumber     int    `json:"season_number,omitempty"`
+	EpisodeNumber    int    `json:"episode_number,omitempty"`
+	Monitored        bool   `json:"monitored"`
+	HasFile          bool   `json:"has_file"`
+	MatchKind        string `json:"match_kind"`
+	StatusMessage    string `json:"status_message,omitempty"`
+	FilePath         string `json:"file_path,omitempty"`
+	RootPath         string `json:"root_path,omitempty"`
+	ExistingFileName string `json:"existing_file_name,omitempty"`
+	ExistingFilePath string `json:"existing_file_path,omitempty"`
+	CanImport        bool   `json:"can_import"`
+	CanRescan        bool   `json:"can_rescan"`
 }
 
 type ComparisonGroup struct {
@@ -996,7 +998,11 @@ func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEn
 						if tm.HasFile {
 							kind = "replaced"
 							canImport = false
-							msg = "Arr already has another file for this title"
+							if tm.ExistingFileName != "" {
+								msg = "Arr already has: " + tm.ExistingFileName
+							} else {
+								msg = "Arr already has another file for this title"
+							}
 						}
 						k := arrItemKey{InstanceID: tm.InstanceID, ItemID: tm.ItemID, Kind: kind}
 						if _, dup := seenArr[k]; dup {
@@ -1009,22 +1015,24 @@ func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEn
 							anyWanted = true
 						}
 						arrMatches = append(arrMatches, ArrReference{
-							InstanceID:    tm.InstanceID,
-							InstanceName:  tm.InstanceName,
-							AppType:       tm.AppType,
-							ItemID:        tm.ItemID,
-							EpisodeIDs:    tm.EpisodeIDs,
-							Title:         tm.Title,
-							Year:          tm.Year,
-							SeasonNumber:  tm.SeasonNumber,
-							EpisodeNumber: tm.EpisodeNumber,
-							Monitored:     tm.Monitored,
-							HasFile:       tm.HasFile,
-							MatchKind:     kind,
-							StatusMessage: msg,
-							FilePath:      importCandidatePath,
-							RootPath:      tm.RootPath,
-							CanImport:     canImport,
+							InstanceID:       tm.InstanceID,
+							InstanceName:     tm.InstanceName,
+							AppType:          tm.AppType,
+							ItemID:           tm.ItemID,
+							EpisodeIDs:       tm.EpisodeIDs,
+							Title:            tm.Title,
+							Year:             tm.Year,
+							SeasonNumber:     tm.SeasonNumber,
+							EpisodeNumber:    tm.EpisodeNumber,
+							Monitored:        tm.Monitored,
+							HasFile:          tm.HasFile,
+							MatchKind:        kind,
+							StatusMessage:    msg,
+							FilePath:         importCandidatePath,
+							RootPath:         tm.RootPath,
+							ExistingFileName: tm.ExistingFileName,
+							ExistingFilePath: tm.ExistingFilePath,
+							CanImport:        canImport,
 						})
 					}
 				}

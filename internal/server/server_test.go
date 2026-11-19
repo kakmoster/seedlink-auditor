@@ -1100,6 +1100,11 @@ func TestRadarrAndSonarrIntegration(t *testing.T) {
 	wantedEpDl := filepath.Join(dlDir, "tv", "Severance.S01E02.1080p.mkv")
 	writeTestFile(t, wantedEpDl, makePayload("sev2", wantedEpSize))
 
+	// 8. Replaced/older Sonarr episode in Downloads (Sonarr already has S01E01)
+	replacedEpSize := 36 * 1024
+	replacedEpDl := filepath.Join(dlDir, "tv", "Severance.S01E01.720p.mkv")
+	writeTestFile(t, replacedEpDl, makePayload("sev1-old", replacedEpSize))
+
 	mq := newMockQbitServer(t, []mockTorrent{
 		{
 			Hash:     "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
@@ -1333,11 +1338,20 @@ func TestRadarrAndSonarrIntegration(t *testing.T) {
 	if mementoGrp.ArrSummary != "UNLINKED_IN_LIBRARY" || !mementoGrp.HasArrIssue || len(mementoGrp.ArrMatches) == 0 || !mementoGrp.ArrMatches[0].CanRescan {
 		t.Fatalf("expected Memento to be UNLINKED_IN_LIBRARY with CanRescan=true, got %+v", mementoGrp)
 	}
-	if byName["Blade.Runner.2049.2017.720p.mkv"].ArrSummary != "REPLACED_IN_ARR" {
-		t.Fatalf("expected Blade Runner 2049 to be REPLACED_IN_ARR, got %+v", byName["Blade.Runner.2049.2017.720p.mkv"])
+	brGrp := byName["Blade.Runner.2049.2017.720p.mkv"]
+	if brGrp.ArrSummary != "REPLACED_IN_ARR" || len(brGrp.ArrMatches) == 0 ||
+		brGrp.ArrMatches[0].ExistingFileName != "Blade Runner 2049 (2017) 2160p.mkv" ||
+		!strings.HasSuffix(brGrp.ArrMatches[0].ExistingFilePath, "/Blade Runner 2049 (2017) 2160p.mkv") {
+		t.Fatalf("expected Blade Runner 2049 REPLACED_IN_ARR with ExistingFileName/ExistingFilePath, got %+v", brGrp)
 	}
 	if byName["Severance.S01E02.1080p.mkv"].ArrSummary != "WANTED_NOT_IMPORTED" {
 		t.Fatalf("expected Severance S01E02 to be WANTED_NOT_IMPORTED, got %+v", byName["Severance.S01E02.1080p.mkv"])
+	}
+	sevOldGrp := byName["Severance.S01E01.720p.mkv"]
+	if sevOldGrp.ArrSummary != "REPLACED_IN_ARR" || len(sevOldGrp.ArrMatches) == 0 ||
+		sevOldGrp.ArrMatches[0].ExistingFileName != "Severance - S01E01.mkv" ||
+		!strings.HasSuffix(sevOldGrp.ArrMatches[0].ExistingFilePath, "/Severance - S01E01.mkv") {
+		t.Fatalf("expected Severance.S01E01.720p REPLACED_IN_ARR with ExistingFileName 'Severance - S01E01.mkv', got %+v", sevOldGrp)
 	}
 
 	// 3. Verify Read-Only Mode blocks arr-import & arr-rescan (403) while dry_run=true returns 200

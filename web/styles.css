@@ -923,6 +923,15 @@ code {
   word-break: break-word;
 }
 
+.arr-existing-file {
+  margin-top: 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
 .arr-sync-badge {
   display: inline-flex;
   align-items: center;

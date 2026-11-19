@@ -95,30 +95,34 @@ type ArrLibraryEntry struct {
 }
 
 type ArrTitleMatch struct {
-	InstanceID    string `json:"instance_id"`
-	InstanceName  string `json:"instance_name"`
-	AppType       string `json:"app_type"`
-	ItemID        int    `json:"item_id"`
-	EpisodeIDs    []int  `json:"episode_ids,omitempty"`
-	Title         string `json:"title"`
-	Year          int    `json:"year,omitempty"`
-	SeasonNumber  int    `json:"season_number,omitempty"`
-	EpisodeNumber int    `json:"episode_number,omitempty"`
-	Monitored     bool   `json:"monitored"`
-	HasFile       bool   `json:"has_file"`
-	RootPath      string `json:"root_path"`
+	InstanceID       string `json:"instance_id"`
+	InstanceName     string `json:"instance_name"`
+	AppType          string `json:"app_type"`
+	ItemID           int    `json:"item_id"`
+	EpisodeIDs       []int  `json:"episode_ids,omitempty"`
+	Title            string `json:"title"`
+	Year             int    `json:"year,omitempty"`
+	SeasonNumber     int    `json:"season_number,omitempty"`
+	EpisodeNumber    int    `json:"episode_number,omitempty"`
+	Monitored        bool   `json:"monitored"`
+	HasFile          bool   `json:"has_file"`
+	RootPath         string `json:"root_path"`
+	ExistingFileName string `json:"existing_file_name,omitempty"`
+	ExistingFilePath string `json:"existing_file_path,omitempty"`
 }
 
 type radarrTitleItem struct {
-	InstanceID   string
-	InstanceName string
-	ItemID       int
-	Title        string
-	NormTitles   []string
-	Year         int
-	Monitored    bool
-	HasFile      bool
-	RootPath     string
+	InstanceID       string
+	InstanceName     string
+	ItemID           int
+	Title            string
+	NormTitles       []string
+	Year             int
+	Monitored        bool
+	HasFile          bool
+	RootPath         string
+	ExistingFileName string
+	ExistingFilePath string
 }
 
 type sonarrSeriesItem struct {
@@ -151,29 +155,45 @@ type nameSizeKey struct {
 }
 
 type Index struct {
-	ByPath         map[string][]ArrFileEntry
-	ByPathCI       map[string][]ArrFileEntry
-	ByNameSize     map[nameSizeKey][]ArrFileEntry
-	QueueByHash    map[string][]ArrQueueEntry
-	LibraryRoots   []ArrLibraryEntry
-	RadarrTitles   []radarrTitleItem
-	SonarrSeries   []sonarrSeriesItem
-	WantedEpisodes map[wantedEpisodeKey]wantedEpisodeInfo
-	Instances      []InstanceReport
+	ByPath           map[string][]ArrFileEntry
+	ByPathCI         map[string][]ArrFileEntry
+	ByNameSize       map[nameSizeKey][]ArrFileEntry
+	QueueByHash      map[string][]ArrQueueEntry
+	LibraryRoots     []ArrLibraryEntry
+	RadarrTitles     []radarrTitleItem
+	SonarrSeries     []sonarrSeriesItem
+	WantedEpisodes   map[wantedEpisodeKey]wantedEpisodeInfo
+	ExistingEpisodes map[wantedEpisodeKey]ArrFileEntry
+	Instances        []InstanceReport
 }
 
 func NewIndex() *Index {
 	return &Index{
-		ByPath:         make(map[string][]ArrFileEntry),
-		ByPathCI:       make(map[string][]ArrFileEntry),
-		ByNameSize:     make(map[nameSizeKey][]ArrFileEntry),
-		QueueByHash:    make(map[string][]ArrQueueEntry),
-		LibraryRoots:   make([]ArrLibraryEntry, 0),
-		RadarrTitles:   make([]radarrTitleItem, 0),
-		SonarrSeries:   make([]sonarrSeriesItem, 0),
-		WantedEpisodes: make(map[wantedEpisodeKey]wantedEpisodeInfo),
-		Instances:      make([]InstanceReport, 0),
+		ByPath:           make(map[string][]ArrFileEntry),
+		ByPathCI:         make(map[string][]ArrFileEntry),
+		ByNameSize:       make(map[nameSizeKey][]ArrFileEntry),
+		QueueByHash:      make(map[string][]ArrQueueEntry),
+		LibraryRoots:     make([]ArrLibraryEntry, 0),
+		RadarrTitles:     make([]radarrTitleItem, 0),
+		SonarrSeries:     make([]sonarrSeriesItem, 0),
+		WantedEpisodes:   make(map[wantedEpisodeKey]wantedEpisodeInfo),
+		ExistingEpisodes: make(map[wantedEpisodeKey]ArrFileEntry),
+		Instances:        make([]InstanceReport, 0),
 	}
+}
+
+func extractSeasonEpisode(raw string) (season int, episode int, prefix string, ok bool) {
+	spaced := strings.NewReplacer(".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ").Replace(raw)
+	loc := seasonEpisodeRe.FindStringSubmatchIndex(spaced)
+	if loc == nil {
+		return 0, 0, "", false
+	}
+	seasonNum, sErr := strconv.Atoi(spaced[loc[2]:loc[3]])
+	epNum, eErr := strconv.Atoi(spaced[loc[4]:loc[5]])
+	if sErr != nil || eErr != nil {
+		return 0, 0, "", false
+	}
+	return seasonNum, epNum, normalizeTitle(spaced[:loc[0]]), true
 }
 
 func (idx *Index) addFileEntry(e ArrFileEntry) {
@@ -182,6 +202,21 @@ func (idx *Index) addFileEntry(e ArrFileEntry) {
 	idx.ByPathCI[strings.ToLower(norm)] = append(idx.ByPathCI[strings.ToLower(norm)], e)
 	k := nameSizeKey{NameLower: strings.ToLower(e.Filename), Size: e.Size}
 	idx.ByNameSize[k] = append(idx.ByNameSize[k], e)
+	if e.AppType == "sonarr" && e.ItemID > 0 {
+		seasonNum, epNum, _, ok := extractSeasonEpisode(e.Filename)
+		if !ok {
+			seasonNum, epNum, _, ok = extractSeasonEpisode(e.MappedPath)
+		}
+		if ok {
+			wk := wantedEpisodeKey{
+				InstanceID: e.InstanceID,
+				SeriesID:   e.ItemID,
+				Season:     seasonNum,
+				Episode:    epNum,
+			}
+			idx.ExistingEpisodes[wk] = e
+		}
+	}
 }
 
 func (idx *Index) FindFileMatches(absPath, filename string, size int64) []ArrFileMatch {
@@ -347,33 +382,25 @@ func (idx *Index) FindTitleMatches(filename, torrentName string) []ArrTitleMatch
 			}
 			seen[key] = struct{}{}
 			out = append(out, ArrTitleMatch{
-				InstanceID:   m.InstanceID,
-				InstanceName: m.InstanceName,
-				AppType:      "radarr",
-				ItemID:       m.ItemID,
-				Title:        m.Title,
-				Year:         m.Year,
-				Monitored:    m.Monitored,
-				HasFile:      m.HasFile,
-				RootPath:     m.RootPath,
+				InstanceID:       m.InstanceID,
+				InstanceName:     m.InstanceName,
+				AppType:          "radarr",
+				ItemID:           m.ItemID,
+				Title:            m.Title,
+				Year:             m.Year,
+				Monitored:        m.Monitored,
+				HasFile:          m.HasFile,
+				RootPath:         m.RootPath,
+				ExistingFileName: m.ExistingFileName,
+				ExistingFilePath: m.ExistingFilePath,
 			})
 		}
 	}
 
-	// 2. Sonarr SxxExx + series title matching against wanted/missing episodes
+	// 2. Sonarr SxxExx + series title matching against wanted/missing or existing episodes
 	for _, raw := range candidates {
-		spaced := strings.NewReplacer(".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ").Replace(raw)
-		loc := seasonEpisodeRe.FindStringSubmatchIndex(spaced)
-		if loc == nil {
-			continue
-		}
-		seasonNum, sErr := strconv.Atoi(spaced[loc[2]:loc[3]])
-		epNum, eErr := strconv.Atoi(spaced[loc[4]:loc[5]])
-		if sErr != nil || eErr != nil {
-			continue
-		}
-		prefix := normalizeTitle(spaced[:loc[0]])
-		if prefix == "" {
+		seasonNum, epNum, prefix, ok := extractSeasonEpisode(raw)
+		if !ok || prefix == "" {
 			continue
 		}
 		for _, sr := range idx.SonarrSeries {
@@ -389,29 +416,48 @@ func (idx *Index) FindTitleMatches(filename, torrentName string) []ArrTitleMatch
 				Season:     seasonNum,
 				Episode:    epNum,
 			}
-			wantedEp, isWanted := idx.WantedEpisodes[wk]
-			if !isWanted {
-				continue
+			if wantedEp, isWanted := idx.WantedEpisodes[wk]; isWanted {
+				key := fmt.Sprintf("sonarr:%s:%d:%d", sr.InstanceID, sr.SeriesID, wantedEp.EpisodeID)
+				if _, dup := seen[key]; dup {
+					continue
+				}
+				seen[key] = struct{}{}
+				out = append(out, ArrTitleMatch{
+					InstanceID:    sr.InstanceID,
+					InstanceName:  sr.InstanceName,
+					AppType:       "sonarr",
+					ItemID:        sr.SeriesID,
+					EpisodeIDs:    []int{wantedEp.EpisodeID},
+					Title:         sr.Title,
+					Year:          sr.Year,
+					SeasonNumber:  seasonNum,
+					EpisodeNumber: epNum,
+					Monitored:     sr.Monitored && wantedEp.Monitored,
+					HasFile:       false,
+					RootPath:      sr.RootPath,
+				})
+			} else if existingEp, hasExisting := idx.ExistingEpisodes[wk]; hasExisting {
+				key := fmt.Sprintf("sonarr:%s:%d:S%dE%d", sr.InstanceID, sr.SeriesID, seasonNum, epNum)
+				if _, dup := seen[key]; dup {
+					continue
+				}
+				seen[key] = struct{}{}
+				out = append(out, ArrTitleMatch{
+					InstanceID:       sr.InstanceID,
+					InstanceName:     sr.InstanceName,
+					AppType:          "sonarr",
+					ItemID:           sr.SeriesID,
+					Title:            sr.Title,
+					Year:             sr.Year,
+					SeasonNumber:     seasonNum,
+					EpisodeNumber:    epNum,
+					Monitored:        sr.Monitored,
+					HasFile:          true,
+					RootPath:         sr.RootPath,
+					ExistingFileName: existingEp.Filename,
+					ExistingFilePath: existingEp.MappedPath,
+				})
 			}
-			key := fmt.Sprintf("sonarr:%s:%d:%d", sr.InstanceID, sr.SeriesID, wantedEp.EpisodeID)
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			out = append(out, ArrTitleMatch{
-				InstanceID:    sr.InstanceID,
-				InstanceName:  sr.InstanceName,
-				AppType:       "sonarr",
-				ItemID:        sr.SeriesID,
-				EpisodeIDs:    []int{wantedEp.EpisodeID},
-				Title:         sr.Title,
-				Year:          sr.Year,
-				SeasonNumber:  seasonNum,
-				EpisodeNumber: epNum,
-				Monitored:     sr.Monitored && wantedEp.Monitored,
-				HasFile:       false,
-				RootPath:      sr.RootPath,
-			})
 		}
 	}
 
@@ -932,19 +978,9 @@ func radarrMovieToData(inst config.ArrInstanceConfig, m radarrMovieJSON) (ArrLib
 	if ot := normalizeTitle(m.OriginalTitle); ot != "" && (len(normTitles) == 0 || ot != normTitles[0]) {
 		normTitles = append(normTitles, ot)
 	}
-	titleItem := radarrTitleItem{
-		InstanceID:   inst.ID,
-		InstanceName: inst.Name,
-		ItemID:       m.ID,
-		Title:        m.Title,
-		NormTitles:   normTitles,
-		Year:         m.Year,
-		Monitored:    m.Monitored,
-		HasFile:      m.HasFile,
-		RootPath:     mappedRoot,
-	}
-
 	var fileEntry *ArrFileEntry
+	var existingFileName string
+	var existingFilePath string
 	if m.MovieFile != nil {
 		rawPath := m.MovieFile.Path
 		if rawPath == "" && m.Path != "" && m.MovieFile.RelativePath != "" {
@@ -952,6 +988,8 @@ func radarrMovieToData(inst config.ArrInstanceConfig, m radarrMovieJSON) (ArrLib
 		}
 		if rawPath != "" {
 			mapped := qbit.ApplyPathMappings(rawPath, inst.PathMappings)
+			existingFilePath = mapped
+			existingFileName = path.Base(mapped)
 			fileEntry = &ArrFileEntry{
 				InstanceID:   inst.ID,
 				InstanceName: inst.Name,
@@ -962,10 +1000,26 @@ func radarrMovieToData(inst config.ArrInstanceConfig, m radarrMovieJSON) (ArrLib
 				Monitored:    m.Monitored,
 				RemotePath:   qbit.NormalizeSlashPath(rawPath),
 				MappedPath:   mapped,
-				Filename:     path.Base(mapped),
+				Filename:     existingFileName,
 				Size:         m.MovieFile.Size,
 			}
+		} else if m.MovieFile.RelativePath != "" {
+			existingFileName = path.Base(qbit.NormalizeSlashPath(m.MovieFile.RelativePath))
 		}
+	}
+
+	titleItem := radarrTitleItem{
+		InstanceID:       inst.ID,
+		InstanceName:     inst.Name,
+		ItemID:           m.ID,
+		Title:            m.Title,
+		NormTitles:       normTitles,
+		Year:             m.Year,
+		Monitored:        m.Monitored,
+		HasFile:          m.HasFile,
+		RootPath:         mappedRoot,
+		ExistingFileName: existingFileName,
+		ExistingFilePath: existingFilePath,
 	}
 	return libEntry, titleItem, fileEntry
 }
