@@ -1415,16 +1415,28 @@ func (c *Client) PreviewManualImport(ctx context.Context, inst config.ArrInstanc
 	return items, nil
 }
 
-func (c *Client) TriggerDownloadScan(ctx context.Context, inst config.ArrInstanceConfig, remotePath, downloadClientID string) (CommandResponse, error) {
+func normalizeImportMode(raw string) (scanMode string, manualMode string) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "copy":
+		return "Copy", "copy"
+	case "move":
+		return "Move", "move"
+	default:
+		return "Auto", "auto"
+	}
+}
+
+func (c *Client) TriggerDownloadScan(ctx context.Context, inst config.ArrInstanceConfig, remotePath, downloadClientID, importMode string) (CommandResponse, error) {
 	baseURL := strings.TrimRight(strings.TrimSpace(inst.URL), "/")
 	cmdName := "DownloadedMoviesScan"
 	if strings.ToLower(inst.Type) == "sonarr" {
 		cmdName = "DownloadedEpisodesScan"
 	}
+	scanMode, _ := normalizeImportMode(importMode)
 	payload := map[string]any{
 		"name":       cmdName,
 		"path":       remotePath,
-		"importMode": "Auto",
+		"importMode": scanMode,
 	}
 	if strings.TrimSpace(downloadClientID) != "" {
 		payload["downloadClientId"] = strings.ToUpper(strings.TrimSpace(downloadClientID))
@@ -1434,11 +1446,12 @@ func (c *Client) TriggerDownloadScan(ctx context.Context, inst config.ArrInstanc
 	return res, err
 }
 
-func (c *Client) TriggerManualImport(ctx context.Context, inst config.ArrInstanceConfig, files []ManualImportFilePayload) (CommandResponse, error) {
+func (c *Client) TriggerManualImport(ctx context.Context, inst config.ArrInstanceConfig, files []ManualImportFilePayload, importMode string) (CommandResponse, error) {
 	baseURL := strings.TrimRight(strings.TrimSpace(inst.URL), "/")
+	_, manualMode := normalizeImportMode(importMode)
 	payload := map[string]any{
 		"name":       "ManualImport",
-		"importMode": "auto",
+		"importMode": manualMode,
 		"files":      files,
 	}
 	var res CommandResponse

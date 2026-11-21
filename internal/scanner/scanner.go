@@ -923,6 +923,15 @@ func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEn
 			if qm.IsBlocked {
 				anyQueueBlocked = true
 			}
+			var queueRootPath string
+			if qm.ItemID > 0 {
+				for _, lib := range arrIndex.LibraryRoots {
+					if lib.InstanceID == qm.InstanceID && lib.ItemID == qm.ItemID && lib.MappedPath != "" {
+						queueRootPath = lib.MappedPath
+						break
+					}
+				}
+			}
 			arrMatches = append(arrMatches, ArrReference{
 				InstanceID:    qm.InstanceID,
 				InstanceName:  qm.InstanceName,
@@ -934,6 +943,7 @@ func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEn
 				MatchKind:     "queue",
 				StatusMessage: msg,
 				FilePath:      importCandidatePath,
+				RootPath:      queueRootPath,
 				CanImport:     len(inA) == 0 || qm.IsBlocked,
 			})
 		}

@@ -589,6 +589,7 @@ type ArrImportItem struct {
 	DownloadClientID string `json:"download_client_id"`
 	ItemID           int    `json:"item_id"`
 	EpisodeIDs       []int  `json:"episode_ids"`
+	TargetRootPath   string `json:"target_root_path,omitempty"`
 }
 
 type ArrImportEntryResult struct {
@@ -597,6 +598,8 @@ type ArrImportEntryResult struct {
 	AppType          string   `json:"app_type"`
 	LocalPath        string   `json:"local_path"`
 	RemotePath       string   `json:"remote_path"`
+	TargetRootPath   string   `json:"target_root_path,omitempty"`
+	ImportMode       string   `json:"import_mode,omitempty"`
 	ParsedTitle      string   `json:"parsed_title,omitempty"`
 	Rejections       []string `json:"rejections"`
 	CommandName      string   `json:"command_name"`
@@ -614,6 +617,7 @@ type ArrActionError struct {
 type ArrImportResult struct {
 	DryRun            bool                   `json:"dry_run"`
 	ForceManualImport bool                   `json:"force_manual_import"`
+	ImportMode        string                 `json:"import_mode,omitempty"`
 	TriggeredCount    int                    `json:"triggered_count"`
 	Results           []ArrImportEntryResult `json:"results"`
 	Errors            []ArrActionError       `json:"errors"`
@@ -643,17 +647,31 @@ type ArrRescanResult struct {
 	Errors         []ArrActionError       `json:"errors"`
 }
 
+func normalizeArrImportMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "copy":
+		return "copy"
+	case "move":
+		return "move"
+	default:
+		return "auto"
+	}
+}
+
 func TriggerArrImportAction(
 	ctx context.Context,
 	settings config.AppSettings,
 	arrClient *arr.Client,
 	items []ArrImportItem,
 	forceManualImport bool,
+	importMode string,
 	dryRun bool,
 ) (ArrImportResult, error) {
 	if err := ensureWritable(settings, dryRun); err != nil {
 		return ArrImportResult{}, err
 	}
+
+	effMode := normalizeArrImportMode(importMode)
 
 	instancesByID := make(map[string]config.ArrInstanceConfig, len(settings.ArrInstances))
 	for _, inst := range settings.ArrInstances {
@@ -663,6 +681,7 @@ func TriggerArrImportAction(
 	res := ArrImportResult{
 		DryRun:            dryRun,
 		ForceManualImport: forceManualImport,
+		ImportMode:        effMode,
 		Results:           make([]ArrImportEntryResult, 0, len(items)),
 		Errors:            make([]ArrActionError, 0),
 	}
@@ -736,6 +755,8 @@ func TriggerArrImportAction(
 			AppType:          inst.Type,
 			LocalPath:        localPath,
 			RemotePath:       remotePath,
+			TargetRootPath:   strings.TrimSpace(it.TargetRootPath),
+			ImportMode:       effMode,
 			ParsedTitle:      parsedTitle,
 			Rejections:       rejections,
 			CommandName:      cmdName,
@@ -779,9 +800,9 @@ func TriggerArrImportAction(
 						payload.EpisodeIDs = it.EpisodeIDs
 					}
 				}
-				cmdResp, cmdErr = arrClient.TriggerManualImport(ctx, inst, []arr.ManualImportFilePayload{payload})
+				cmdResp, cmdErr = arrClient.TriggerManualImport(ctx, inst, []arr.ManualImportFilePayload{payload}, effMode)
 			} else {
-				cmdResp, cmdErr = arrClient.TriggerDownloadScan(ctx, inst, remotePath, strings.ToUpper(strings.TrimSpace(it.DownloadClientID)))
+				cmdResp, cmdErr = arrClient.TriggerDownloadScan(ctx, inst, remotePath, strings.ToUpper(strings.TrimSpace(it.DownloadClientID)), effMode)
 			}
 			if cmdErr != nil {
 				res.Errors = append(res.Errors, ArrActionError{

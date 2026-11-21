@@ -1331,8 +1331,8 @@ func TestRadarrAndSonarrIntegration(t *testing.T) {
 	if matrixGrp.ArrSummary != "WANTED_NOT_IMPORTED" || !matrixGrp.HasArrIssue || len(matrixGrp.ArrMatches) == 0 || !matrixGrp.ArrMatches[0].CanImport {
 		t.Fatalf("expected Matrix to be WANTED_NOT_IMPORTED with CanImport=true, got %+v", matrixGrp)
 	}
-	if byName["Heat.1995.BluRay.mkv"].ArrSummary != "IN_QUEUE_BLOCKED" || !byName["Heat.1995.BluRay.mkv"].HasArrIssue {
-		t.Fatalf("expected Heat to be IN_QUEUE_BLOCKED, got %+v", byName["Heat.1995.BluRay.mkv"])
+	if heatGrp := byName["Heat.1995.BluRay.mkv"]; heatGrp.ArrSummary != "IN_QUEUE_BLOCKED" || !heatGrp.HasArrIssue || len(heatGrp.ArrMatches) == 0 || heatGrp.ArrMatches[0].RootPath == "" {
+		t.Fatalf("expected Heat to be IN_QUEUE_BLOCKED with RootPath populated, got %+v", heatGrp)
 	}
 	mementoGrp := byName["Memento (2000).mkv"]
 	if mementoGrp.ArrSummary != "UNLINKED_IN_LIBRARY" || !mementoGrp.HasArrIssue || len(mementoGrp.ArrMatches) == 0 || !mementoGrp.ArrMatches[0].CanRescan {
@@ -1361,6 +1361,7 @@ func TestRadarrAndSonarrIntegration(t *testing.T) {
 			"local_path":         wantedDl,
 			"download_client_id": "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
 			"item_id":            20,
+			"target_root_path":   matrixGrp.ArrMatches[0].RootPath,
 		}},
 		"force_manual_import": false,
 		"dry_run":             true,
@@ -1368,6 +1369,9 @@ func TestRadarrAndSonarrIntegration(t *testing.T) {
 	var dryImp actions.ArrImportResult
 	if c := apiDoJSON(t, ts, http.MethodPost, "/api/actions/arr-import", importPayload, &dryImp); c != http.StatusOK || dryImp.TriggeredCount != 1 {
 		t.Fatalf("expected dry_run arr-import to succeed, got code=%d res=%+v", c, dryImp)
+	}
+	if dryImp.ImportMode != "auto" || dryImp.Results[0].TargetRootPath != matrixGrp.ArrMatches[0].RootPath {
+		t.Fatalf("expected dry_run auto mode and target_root_path echoed, got %+v", dryImp.Results[0])
 	}
 	if len(dryImp.Results[0].Rejections) != 1 || dryImp.Results[0].Rejections[0] != "Not an upgrade" {
 		t.Fatalf("expected manualimport preview rejection to be surfaced, got %+v", dryImp.Results[0])
@@ -1386,7 +1390,7 @@ func TestRadarrAndSonarrIntegration(t *testing.T) {
 		t.Fatalf("expected 403 for arr-rescan in read-only mode, got %d", c)
 	}
 
-	// 4. Unlock write mode and execute DownloadedMoviesScan, ManualImport, and RefreshMovie
+	// 4. Unlock write mode and execute DownloadedMoviesScan, ManualImport, RefreshMovie, and explicit import_mode="copy"
 	apiDoJSON(t, ts, http.MethodPatch, "/api/config/read-only", map[string]bool{"read_only_mode": false}, nil)
 
 	var execImp actions.ArrImportResult
@@ -1405,11 +1409,24 @@ func TestRadarrAndSonarrIntegration(t *testing.T) {
 		t.Fatalf("expected arr-rescan execution to succeed, got code=%d res=%+v", c, execRescan)
 	}
 
+	importPayload["force_manual_import"] = false
+	importPayload["import_mode"] = "copy"
+	var execCopyScan actions.ArrImportResult
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/actions/arr-import", importPayload, &execCopyScan); c != http.StatusOK || execCopyScan.TriggeredCount != 1 || execCopyScan.ImportMode != "copy" {
+		t.Fatalf("expected copy import scan to succeed, got code=%d res=%+v", c, execCopyScan)
+	}
+
+	importPayload["force_manual_import"] = true
+	var execCopyManual actions.ArrImportResult
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/actions/arr-import", importPayload, &execCopyManual); c != http.StatusOK || execCopyManual.TriggeredCount != 1 || execCopyManual.ImportMode != "copy" {
+		t.Fatalf("expected copy manual import to succeed, got code=%d res=%+v", c, execCopyManual)
+	}
+
 	radarrMock.mu.Lock()
 	cmds := append([]map[string]any(nil), radarrMock.commands...)
 	radarrMock.mu.Unlock()
-	if len(cmds) != 3 {
-		t.Fatalf("expected 3 Radarr commands received, got %d: %+v", len(cmds), cmds)
+	if len(cmds) != 5 {
+		t.Fatalf("expected 5 Radarr commands received, got %d: %+v", len(cmds), cmds)
 	}
 	if cmds[0]["name"] != "DownloadedMoviesScan" || cmds[0]["path"] != "/arr_downloads/movies/The.Matrix.1999.2160p.mkv" || cmds[0]["importMode"] != "Auto" {
 		t.Fatalf("unexpected DownloadedMoviesScan payload: %+v", cmds[0])
@@ -1419,6 +1436,12 @@ func TestRadarrAndSonarrIntegration(t *testing.T) {
 	}
 	if cmds[2]["name"] != "RefreshMovie" {
 		t.Fatalf("unexpected RefreshMovie payload: %+v", cmds[2])
+	}
+	if cmds[3]["name"] != "DownloadedMoviesScan" || cmds[3]["importMode"] != "Copy" {
+		t.Fatalf("unexpected explicit copy DownloadedMoviesScan payload: %+v", cmds[3])
+	}
+	if cmds[4]["name"] != "ManualImport" || cmds[4]["importMode"] != "copy" {
+		t.Fatalf("unexpected explicit copy ManualImport payload: %+v", cmds[4])
 	}
 }
 

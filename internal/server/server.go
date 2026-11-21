@@ -678,6 +678,7 @@ func (s *Server) handleArrImport(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
 		Items             []actions.ArrImportItem `json:"items"`
 		ForceManualImport bool                    `json:"force_manual_import"`
+		ImportMode        string                  `json:"import_mode"`
 		DryRun            bool                    `json:"dry_run"`
 	}
 	if err := decodeJSONBody(w, r, &payload); err != nil {
@@ -685,7 +686,7 @@ func (s *Server) handleArrImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := actions.TriggerArrImportAction(r.Context(), s.cfgMgr.Get(), s.arrClient, payload.Items, payload.ForceManualImport, payload.DryRun)
+	res, err := actions.TriggerArrImportAction(r.Context(), s.cfgMgr.Get(), s.arrClient, payload.Items, payload.ForceManualImport, payload.ImportMode, payload.DryRun)
 	if err != nil {
 		if errors.Is(err, actions.ErrReadOnlyMode) {
 			writeError(w, http.StatusForbidden, err.Error())

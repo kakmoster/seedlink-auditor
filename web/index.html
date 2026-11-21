@@ -173,16 +173,16 @@
 
           <div class="bulk-actions">
             <span class="selection-badge" id="selectionBadge">0 selected</span>
-            <button id="bulkArrFixBtn" class="btn btn-secondary btn-sm" type="button" disabled>
+            <button id="bulkArrFixBtn" class="btn btn-secondary btn-sm" type="button" disabled title="Trigger Radarr/Sonarr import or library rescan for selected items">
               Fix Selected in Radarr/Sonarr
             </button>
-            <button id="bulkDeleteTorrentsBtn" class="btn btn-danger btn-sm" type="button" disabled>
+            <button id="bulkDeleteTorrentsBtn" class="btn btn-danger btn-sm" type="button" disabled title="Remove selected torrents from qBittorrent (with optional data file deletion)">
               Delete Torrents + Data in qBit
             </button>
-            <button id="bulkHardlinkBtn" class="btn btn-amber btn-sm" type="button" disabled>
+            <button id="bulkHardlinkBtn" class="btn btn-amber btn-sm" type="button" disabled title="Verify SHA-256 samples and replace duplicate copies with hardlinks to save space">
               Convert Copies &rarr; Hardlinks
             </button>
-            <button id="bulkDeleteFilesBtn" class="btn btn-outline-danger btn-sm" type="button" disabled>
+            <button id="bulkDeleteFilesBtn" class="btn btn-outline-danger btn-sm" type="button" disabled title="Delete selected files directly from disk without touching qBittorrent">
               Delete Files from Disk
             </button>
           </div>
@@ -327,6 +327,9 @@
           <strong>Safe Read-Only Mode is Active.</strong> This preview shows what would happen. Disable Read-Only Mode in the header (or click "Unlock &amp; Execute" below) to apply changes.
         </div>
 
+        <div id="actionExplainBox" class="action-explain-box"></div>
+        <div id="actionContextWarnings" class="alert alert-warning" hidden></div>
+
         <div id="torrentDeleteOptionRow" class="checkbox-row" hidden>
           <label>
             <input type="checkbox" id="deleteTorrentFilesCheckbox" checked />
@@ -335,7 +338,17 @@
         </div>
 
         <div id="arrImportOptionRow" class="checkbox-row" hidden>
-          <label>
+          <div class="arr-mode-row">
+            <label for="arrImportModeSelect">
+              <span>Import Mode</span>
+            </label>
+            <select id="arrImportModeSelect" class="input-control">
+              <option value="copy">Copy / Hardlink (keeps original file — safest for seeding)</option>
+              <option value="auto">Auto (Arr decides — hardlinks tracked downloads, may MOVE untracked files)</option>
+              <option value="move">Move (relocates file into Arr library &amp; removes original path)</option>
+            </select>
+          </div>
+          <label style="margin-top: 8px;">
             <input type="checkbox" id="forceManualImportCheckbox" />
             <span>Force Manual Import (bypass automatic name/rejection checks using matched title/episode)</span>
           </label>

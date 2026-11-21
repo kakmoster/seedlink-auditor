@@ -484,34 +484,34 @@
         const actionBtns = [];
         if (arrMatches.some((m) => m.can_import)) {
           actionBtns.push(
-            `<button class="btn btn-amber btn-xs row-arr-import" data-group-id="${escapeHtml(grp.id)}" type="button">Import to Arr</button>`
+            `<button class="btn btn-amber btn-xs row-arr-import" data-group-id="${escapeHtml(grp.id)}" type="button" title="Tell Radarr/Sonarr to import this file into its library folder">Import to Arr</button>`
           );
         }
         if (arrMatches.some((m) => m.can_rescan)) {
           actionBtns.push(
-            `<button class="btn btn-secondary btn-xs row-arr-rescan" data-group-id="${escapeHtml(grp.id)}" type="button">Rescan in Arr</button>`
+            `<button class="btn btn-secondary btn-xs row-arr-rescan" data-group-id="${escapeHtml(grp.id)}" type="button" title="Scan Arr's existing library folder to link this file without moving it">Rescan in Arr</button>`
           );
         }
         const erroredTorrents = grp.torrents.filter((t) => Boolean(t.tracker_health));
         if (erroredTorrents.length > 0) {
           const errBtnText = grp.has_unregistered ? "Delete Unregistered" : "Delete Errored";
           actionBtns.push(
-            `<button class="btn btn-outline-danger btn-xs row-delete-errored-torrent" data-group-id="${escapeHtml(grp.id)}" type="button">${errBtnText}</button>`
+            `<button class="btn btn-outline-danger btn-xs row-delete-errored-torrent" data-group-id="${escapeHtml(grp.id)}" type="button" title="Remove errored/unregistered torrent(s) from qBittorrent (healthy torrents stay)">${errBtnText}</button>`
           );
         }
         if (grp.torrents.length > 0) {
           actionBtns.push(
-            `<button class="btn btn-danger btn-xs row-delete-torrent" data-group-id="${escapeHtml(grp.id)}" type="button">Delete Torrent</button>`
+            `<button class="btn btn-danger btn-xs row-delete-torrent" data-group-id="${escapeHtml(grp.id)}" type="button" title="Remove matching torrent(s) from qBittorrent (with optional data file delete)">Delete Torrent</button>`
           );
         }
         if (grp.can_hardlink && grp.hardlink_pairs.length > 0) {
           actionBtns.push(
-            `<button class="btn btn-amber btn-xs row-hardlink" data-group-id="${escapeHtml(grp.id)}" type="button">Make Hardlink</button>`
+            `<button class="btn btn-amber btn-xs row-hardlink" data-group-id="${escapeHtml(grp.id)}" type="button" title="Replace duplicate copies with hardlinks to reclaim space">Make Hardlink</button>`
           );
         }
         if (grp.all_paths.length > 0 && (grp.seeding_summary === "UNTRACKED" || grp.status === "ORPHANED_IN_B")) {
           actionBtns.push(
-            `<button class="btn btn-outline-danger btn-xs row-delete-file" data-group-id="${escapeHtml(grp.id)}" type="button">Delete File</button>`
+            `<button class="btn btn-outline-danger btn-xs row-delete-file" data-group-id="${escapeHtml(grp.id)}" type="button" title="Delete file(s) directly from disk">Delete File</button>`
           );
         }
         actionBtns.push(
@@ -879,6 +879,7 @@
                 download_client_id: dlHash,
                 item_id: m.item_id || 0,
                 episode_ids: m.episode_ids || [],
+                target_root_path: m.root_path || "",
               });
             }
           }
@@ -900,17 +901,189 @@
         importItems,
         rescanItems,
         force_manual_import: $("forceManualImportCheckbox").checked,
+        import_mode: ($("arrImportModeSelect") && $("arrImportModeSelect").value) || "auto",
       };
     }
 
     return {};
   }
 
-  async function openActionModal(actionType, groups) {
-    state.pendingAction = { type: actionType, groups };
+  function renderActionExplanation(type, groups, payload, options = {}) {
+    const explainEl = $("actionExplainBox");
+    const warnEl = $("actionContextWarnings");
+    if (!explainEl || !warnEl) return;
+
+    const primaryPaths = new Set();
+    for (const g of groups || []) {
+      for (const f of g.folder_a_files || []) {
+        if (f.abs_path) primaryPaths.add(f.abs_path.toLowerCase());
+      }
+    }
+
+    let title = "What this action will do";
+    const bullets = [];
+    const warnings = [];
+
+    if (type === "convert-hardlinks") {
+      title = "What happens when you Convert Copies \u2192 Hardlinks";
+      bullets.push(
+        "Verifies byte-for-byte identity (SHA-256 head, middle, and tail samples) before changing any file.",
+        "Replaces duplicate copies atomically with filesystem hardlinks sharing the primary file\u2019s inode.",
+        "Keeps all filenames and folder paths unchanged and leaves qBittorrent seeding uninterrupted."
+      );
+    } else if (type === "delete-torrents") {
+      title = options.erroredOnly
+        ? "What happens when you Delete Errored / Unregistered Torrents"
+        : "What happens when you Delete Torrents in qBittorrent";
+      if (payload.delete_files) {
+        bullets.push(
+          "Removes the listed torrent(s) from qBittorrent AND deletes data files at qBittorrent\u2019s save path.",
+          "Hardlinked copies in other folders (such as Plex or cross-seeds) keep their own directory entry; physical disk space is freed only if no other hardlink remains."
+        );
+      } else {
+        bullets.push(
+          "Removes the listed torrent(s) from qBittorrent only (stops tracking/seeding in client).",
+          "Leaves all media files on disk completely untouched in all folders."
+        );
+      }
+      if (options.erroredOnly) {
+        bullets.push("Targets only errored / unregistered torrents; healthy seeding torrents stay untouched.");
+      }
+
+      if (payload.delete_files) {
+        const hitsPrimary = (payload.items || []).some((it) =>
+          (it.expected_paths || []).some((p) => primaryPaths.has(String(p).toLowerCase()))
+        );
+        if (hitsPrimary) {
+          warnings.push(
+            "Warning: At least one torrent\u2019s save path points inside a Primary (Folder A / Plex) folder. Deleting torrent data will delete that Primary file."
+          );
+        }
+      }
+      if (!options.erroredOnly) {
+        const healthyKeys = new Set();
+        for (const g of groups || []) {
+          for (const t of g.torrents || []) {
+            if (t.is_seeding && !t.tracker_health) {
+              healthyKeys.add(`${t.instance_id}::${t.torrent_hash}`);
+            }
+          }
+        }
+        if (healthyKeys.size > 0) {
+          warnings.push(
+            `Warning: ${healthyKeys.size} selected torrent(s) are currently seeding cleanly with no tracker errors.`
+          );
+        }
+      }
+    } else if (type === "delete-files") {
+      title = "What happens when you Delete Files from Disk";
+      bullets.push(
+        "Permanently unlinks/deletes the listed file paths from disk and removes empty parent subdirectories inside configured folders.",
+        "Does NOT remove torrents from qBittorrent (and does not directly edit Radarr/Sonarr)."
+      );
+      if ((groups || []).some((g) => (g.torrents || []).length > 0)) {
+        warnings.push(
+          "Warning: Some selected items are still tracked in qBittorrent. Deleting files directly from disk will cause Missing Files errors in qBittorrent \u2014 use Delete Torrent instead if you want to remove the torrent."
+        );
+      }
+      if ((payload.file_paths || []).some((p) => primaryPaths.has(String(p).toLowerCase()))) {
+        warnings.push("Warning: One or more files to be deleted are inside a Primary (Folder A / Plex) folder.");
+      }
+      if ((groups || []).some((g) => g.status === "ORPHANED_IN_B" && g.external_hardlink_count > 0)) {
+        warnings.push(
+          "Note: External hardlinks still exist elsewhere on disk for at least one item, so removing these paths will not free physical disk space."
+        );
+      }
+    } else if (type === "arr-rescan") {
+      title = "What happens when you Rescan in Radarr / Sonarr";
+      bullets.push(
+        "Triggers RefreshMovie / RescanSeries in Radarr or Sonarr so it scans the item\u2019s existing library folder on disk.",
+        "Links unlinked files already inside Arr\u2019s library folder without moving, renaming, or deleting any files.",
+        "Does NOT touch qBittorrent."
+      );
+    } else if (type === "arr-import" || type === "arr-fix") {
+      title =
+        type === "arr-fix"
+          ? "What happens when you Fix in Radarr / Sonarr"
+          : "What happens when you Import into Radarr / Sonarr";
+      const importCount = (payload.importItems || []).length;
+      const rescanCount = (payload.rescanItems || []).length;
+      if (importCount > 0) {
+        if (payload.force_manual_import) {
+          bullets.push(
+            "Import Method: Force Manual Import \u2014 instructs Arr to import matched files directly using their matched movie/episode IDs, bypassing automatic rejections."
+          );
+        } else {
+          bullets.push(
+            "Import Method: DownloadedMoviesScan / DownloadedEpisodesScan \u2014 asks Radarr/Sonarr to identify the release and import it into its configured movie/series library folder shown below."
+          );
+        }
+        if (payload.import_mode === "copy") {
+          bullets.push(
+            "Import Mode: Copy / Hardlink \u2014 keeps the original file in place (creating a hardlink on the same filesystem, or copying otherwise). Recommended while seeding or importing from a Primary folder."
+          );
+        } else if (payload.import_mode === "move") {
+          bullets.push(
+            "Import Mode: Move \u2014 relocates/renames the file into Radarr/Sonarr\u2019s library folder and removes the original source file path."
+          );
+        } else {
+          bullets.push(
+            "Import Mode: Auto \u2014 Arr decides: uses hardlink/copy for tracked download client items, or may MOVE/rename untracked files out of their current folder."
+          );
+        }
+      }
+      if (rescanCount > 0) {
+        bullets.push(
+          "Rescan items: triggers RefreshMovie / RescanSeries to index files already sitting in Arr\u2019s library folder without moving or deleting anything."
+        );
+      }
+      bullets.push(
+        "Does NOT remove or modify torrents in qBittorrent. Runs asynchronously in Arr while SeedLink monitors command completion."
+      );
+
+      if (importCount > 0) {
+        const hasTorrents = (groups || []).some((g) => (g.torrents || []).length > 0);
+        const hitsPrimarySource = (payload.importItems || []).some((it) =>
+          primaryPaths.has(String(it.local_path || "").toLowerCase())
+        );
+        if (payload.import_mode !== "copy" && hasTorrents) {
+          warnings.push(
+            `Warning: Selected item(s) are tracked/seeding in qBittorrent. With Import Mode "${payload.import_mode === "move" ? "Move" : "Auto"}", Radarr/Sonarr can rename/relocate the file into its target folder and break seeding if it moves instead of hardlinking. Switch Import Mode to "Copy / Hardlink" to keep the original path intact.`
+          );
+        }
+        if (hitsPrimarySource) {
+          if (payload.import_mode !== "copy") {
+            warnings.push(
+              "Warning: The source file is already in a Primary (Plex) folder. Moving it may relocate it into Radarr/Sonarr\u2019s target folder (shown below) and break seeding if qBittorrent points here."
+            );
+          } else {
+            warnings.push(
+              "Note: Source file sits in a Primary (Plex) folder. Copy / Hardlink will keep this original path intact while linking/copying to Arr\u2019s target library folder shown below."
+            );
+          }
+        }
+      }
+    }
+
+    explainEl.innerHTML = `
+      <div class="action-explain-title">${escapeHtml(title)}</div>
+      <ul class="action-explain-list">${bullets.map((b) => `<li>${escapeHtml(b)}</li>`).join("")}</ul>
+    `;
+
+    if (warnings.length > 0) {
+      warnEl.hidden = false;
+      warnEl.innerHTML = warnings.map((w) => `<div>${escapeHtml(w)}</div>`).join("");
+    } else {
+      warnEl.hidden = true;
+      warnEl.innerHTML = "";
+    }
+  }
+
+  async function openActionModal(actionType, groups, options = {}) {
+    state.pendingAction = { type: actionType, groups, options };
     const titles = {
       "convert-hardlinks": "Convert Duplicate Copies to Hardlinks",
-      "delete-torrents": "Delete Torrents from qBittorrent",
+      "delete-torrents": options.erroredOnly ? "Delete Errored Torrents from qBittorrent" : "Delete Torrents from qBittorrent",
       "delete-files": "Delete Files from Disk",
       "arr-import": "Import Release into Radarr / Sonarr",
       "arr-rescan": "Rescan Library Item in Radarr / Sonarr",
@@ -922,7 +1095,14 @@
     const arrPayload = (actionType === "arr-import" || actionType === "arr-fix")
       ? buildActionPayloadForGroups(actionType, groups)
       : null;
-    $("arrImportOptionRow").hidden = !(arrPayload && arrPayload.importItems.length > 0);
+    const hasArrImports = Boolean(arrPayload && arrPayload.importItems.length > 0);
+    $("arrImportOptionRow").hidden = !hasArrImports;
+    if (hasArrImports) {
+      const hasTorrentsOrPrimary = (groups || []).some(
+        (g) => (g.torrents && g.torrents.length > 0) || (g.folder_a_files && g.folder_a_files.length > 0)
+      );
+      $("arrImportModeSelect").value = hasTorrentsOrPrimary ? "copy" : "auto";
+    }
     const isArrAction = actionType.startsWith("arr-");
     $("confirmActionBtn").className = isArrAction ? "btn btn-primary" : "btn btn-danger";
     $("actionModal").hidden = false;
@@ -931,8 +1111,9 @@
 
   async function refreshActionDryRun() {
     if (!state.pendingAction) return;
-    const { type, groups } = state.pendingAction;
+    const { type, groups, options } = state.pendingAction;
     const payload = buildActionPayloadForGroups(type, groups);
+    renderActionExplanation(type, groups, payload, options || {});
     const ro = state.config.read_only_mode;
 
     $("actionReadOnlyBanner").hidden = !ro;
@@ -1005,6 +1186,7 @@
             body: JSON.stringify({
               items: payload.importItems,
               force_manual_import: payload.force_manual_import,
+              import_mode: payload.import_mode,
               dry_run: true,
             }),
           });
@@ -1017,8 +1199,12 @@
             const parsedHtml = r.parsed_title
               ? `<br><small>Arr parsed: ${escapeHtml(r.parsed_title)}</small>`
               : "";
+            const modeLabel = (r.import_mode || payload.import_mode || "auto").toUpperCase();
+            const destHtml = r.target_root_path
+              ? `<span class="preview-dest">&rarr; Target library folder: ${escapeHtml(r.target_root_path)}</span>`
+              : "";
             rowsHtml.push(
-              `<div class="preview-row">[${escapeHtml(r.instance_name)}] ${escapeHtml(r.command_name)}: ${escapeHtml(r.remote_path)}${parsedHtml}${rejHtml}</div>`
+              `<div class="preview-row">[${escapeHtml(r.instance_name)}] ${escapeHtml(r.command_name)} (mode: ${escapeHtml(modeLabel)}): ${escapeHtml(r.remote_path)}${destHtml}${parsedHtml}${rejHtml}</div>`
             );
           }
           for (const e of impRes.errors) {
@@ -1113,6 +1299,7 @@
             body: JSON.stringify({
               items: payload.importItems,
               force_manual_import: payload.force_manual_import,
+              import_mode: payload.import_mode,
               dry_run: false,
             }),
           });
@@ -1563,7 +1750,7 @@
       } else if (btn.classList.contains("row-delete-errored-torrent")) {
         openActionModal("delete-torrents", [
           { ...grp, torrents: grp.torrents.filter((t) => Boolean(t.tracker_health)) },
-        ]);
+        ], { erroredOnly: true });
       } else if (btn.classList.contains("row-delete-torrent")) {
         openActionModal("delete-torrents", [grp]);
       } else if (btn.classList.contains("row-hardlink")) {
@@ -1608,6 +1795,7 @@
     $("closeActionBtn").addEventListener("click", () => ($("actionModal").hidden = true));
     $("cancelActionBtn").addEventListener("click", () => ($("actionModal").hidden = true));
     $("deleteTorrentFilesCheckbox").addEventListener("change", refreshActionDryRun);
+    $("arrImportModeSelect").addEventListener("change", refreshActionDryRun);
     $("forceManualImportCheckbox").addEventListener("change", refreshActionDryRun);
     $("confirmActionBtn").addEventListener("click", () => executePendingAction(false));
     $("unlockAndExecuteBtn").addEventListener("click", () => executePendingAction(true));
