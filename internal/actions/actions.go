@@ -893,3 +893,101 @@ func TriggerArrRescanAction(
 	res.TriggeredCount = len(res.Results)
 	return res, nil
 }
+
+type QbitRelocateItem struct {
+	InstanceID   string `json:"instance_id"`
+	TorrentHash  string `json:"torrent_hash"`
+	NewLocalPath string `json:"new_local_path"`
+}
+
+type QbitRelocateError struct {
+	InstanceID  string `json:"instance_id"`
+	TorrentHash string `json:"torrent_hash"`
+	Error       string `json:"error"`
+}
+
+type QbitRelocateResult struct {
+	DryRun         bool                          `json:"dry_run"`
+	RelocatedCount int                           `json:"relocated_count"`
+	Results        []qbit.RelocateTorrentOutcome `json:"results"`
+	Errors         []QbitRelocateError           `json:"errors"`
+}
+
+// RelocateQbitTorrentsAction updates qBittorrent save paths and filenames for single-file torrents
+// after Radarr/Sonarr has moved and renamed the underlying file on disk.
+func RelocateQbitTorrentsAction(
+	ctx context.Context,
+	settings config.AppSettings,
+	qbitClient *qbit.Client,
+	items []QbitRelocateItem,
+	dryRun bool,
+) (QbitRelocateResult, error) {
+	if err := ensureWritable(settings, dryRun); err != nil {
+		return QbitRelocateResult{}, err
+	}
+
+	instancesByID := make(map[string]config.QbitInstanceConfig, len(settings.QbitInstances))
+	for _, inst := range settings.QbitInstances {
+		instancesByID[inst.ID] = inst
+	}
+
+	res := QbitRelocateResult{
+		DryRun:  dryRun,
+		Results: make([]qbit.RelocateTorrentOutcome, 0, len(items)),
+		Errors:  make([]QbitRelocateError, 0),
+	}
+
+	seen := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		instID := strings.TrimSpace(it.InstanceID)
+		tHash := strings.TrimSpace(it.TorrentHash)
+		localPath := strings.TrimSpace(it.NewLocalPath)
+
+		inst, ok := instancesByID[instID]
+		if !ok {
+			res.Errors = append(res.Errors, QbitRelocateError{
+				InstanceID: instID, TorrentHash: tHash, Error: "Unknown qBittorrent instance ID.",
+			})
+			continue
+		}
+		if tHash == "" {
+			res.Errors = append(res.Errors, QbitRelocateError{
+				InstanceID: instID, TorrentHash: tHash, Error: "Missing torrent hash.",
+			})
+			continue
+		}
+		dedupKey := instID + ":" + strings.ToLower(tHash)
+		if _, dup := seen[dedupKey]; dup {
+			continue
+		}
+		seen[dedupKey] = struct{}{}
+
+		if localPath == "" || isWithinConfiguredFolders(localPath, settings.Folders) == nil {
+			res.Errors = append(res.Errors, QbitRelocateError{
+				InstanceID: instID, TorrentHash: tHash, Error: "Target path is empty or outside configured folders.",
+			})
+			continue
+		}
+		nativeTarget := filepath.FromSlash(localPath)
+		info, statErr := os.Lstat(nativeTarget)
+		if statErr != nil || !info.Mode().IsRegular() {
+			res.Errors = append(res.Errors, QbitRelocateError{
+				InstanceID: instID, TorrentHash: tHash, Error: "Moved target file does not exist on disk.",
+			})
+			continue
+		}
+
+		newRemotePath := qbit.ToRemotePath(localPath, inst.PathMappings)
+		outcome, relErr := qbitClient.RelocateSingleFileTorrent(ctx, inst, tHash, newRemotePath, dryRun)
+		if relErr != nil {
+			res.Errors = append(res.Errors, QbitRelocateError{
+				InstanceID: instID, TorrentHash: tHash, Error: relErr.Error(),
+			})
+			continue
+		}
+		res.Results = append(res.Results, outcome)
+	}
+
+	res.RelocatedCount = len(res.Results)
+	return res, nil
+}

@@ -169,23 +169,43 @@
             <select id="folderFilter" class="input-control">
               <option value="ALL">All Folders</option>
             </select>
+            <select id="sortSelect" class="input-control" title="Sort rows">
+              <option value="default">Sort: Status &amp; Reclaimable</option>
+              <option value="reclaim_desc">Sort: Reclaimable (High &rarr; Low)</option>
+              <option value="size_desc">Sort: Size (Largest first)</option>
+              <option value="name_asc">Sort: Filename (A &rarr; Z)</option>
+              <option value="name_desc">Sort: Filename (Z &rarr; A)</option>
+            </select>
           </div>
 
-          <div class="bulk-actions">
-            <span class="selection-badge" id="selectionBadge">0 selected</span>
-            <button id="bulkArrFixBtn" class="btn btn-secondary btn-sm" type="button" disabled title="Trigger Radarr/Sonarr import or library rescan for selected items">
-              Fix Selected in Radarr/Sonarr
-            </button>
-            <button id="bulkDeleteTorrentsBtn" class="btn btn-danger btn-sm" type="button" disabled title="Remove selected torrents from qBittorrent (with optional data file deletion)">
-              Delete Torrents + Data in qBit
-            </button>
-            <button id="bulkHardlinkBtn" class="btn btn-amber btn-sm" type="button" disabled title="Verify SHA-256 samples and replace duplicate copies with hardlinks to save space">
-              Convert Copies &rarr; Hardlinks
-            </button>
-            <button id="bulkDeleteFilesBtn" class="btn btn-outline-danger btn-sm" type="button" disabled title="Delete selected files directly from disk without touching qBittorrent">
-              Delete Files from Disk
+          <div class="controls-right">
+            <button id="expandPageBtn" class="btn btn-secondary btn-sm" type="button" title="Expand or collapse all details on the current page">
+              Expand Page
             </button>
           </div>
+        </div>
+      </section>
+
+      <!-- Contextual Selection / Bulk Action Bar (shown when rows are selected) -->
+      <section id="bulkBar" class="bulk-bar" hidden>
+        <div class="bulk-bar-left">
+          <span class="selection-badge" id="selectionBadge">0 selected</span>
+          <button id="selectAllMatchingBtn" class="btn btn-ghost btn-xs" type="button" hidden></button>
+          <button id="clearSelectionBtn" class="btn btn-ghost btn-xs" type="button">Clear</button>
+        </div>
+        <div class="bulk-actions">
+          <button id="bulkArrFixBtn" class="btn btn-secondary btn-sm" type="button" disabled title="Trigger Radarr/Sonarr import or library rescan for selected items">
+            Fix in Radarr/Sonarr
+          </button>
+          <button id="bulkDeleteTorrentsBtn" class="btn btn-danger btn-sm" type="button" disabled title="Remove selected torrents from qBittorrent (with optional data file deletion)">
+            Delete Torrents in qBit
+          </button>
+          <button id="bulkHardlinkBtn" class="btn btn-amber btn-sm" type="button" disabled title="Verify SHA-256 samples and replace duplicate copies with hardlinks to save space">
+            Convert &rarr; Hardlinks
+          </button>
+          <button id="bulkDeleteFilesBtn" class="btn btn-outline-danger btn-sm" type="button" disabled title="Delete selected files directly from disk without touching qBittorrent">
+            Delete Files
+          </button>
         </div>
       </section>
 
@@ -196,14 +216,14 @@
             <thead>
               <tr>
                 <th class="col-check">
-                  <input type="checkbox" id="selectAllCheckbox" aria-label="Select all visible rows" />
+                  <input type="checkbox" id="selectAllCheckbox" aria-label="Select all on current page" title="Select all rows on this page" />
                 </th>
-                <th class="col-file">File &amp; Size</th>
-                <th class="col-folders">Folder Presence &amp; Inode Status</th>
-                <th class="col-qbit">qBittorrent Status</th>
+                <th class="col-file">File</th>
+                <th class="col-folders">Folders</th>
+                <th class="col-qbit">qBittorrent</th>
                 <th class="col-arr">Radarr / Sonarr</th>
                 <th class="col-reclaim">Reclaimable</th>
-                <th class="col-actions">Quick Actions</th>
+                <th class="col-actions">Actions</th>
               </tr>
             </thead>
             <tbody id="auditTableBody">
@@ -215,6 +235,26 @@
             </tbody>
           </table>
         </div>
+
+        <div id="paginationBar" class="pagination-bar" hidden>
+          <div class="pagination-info" id="paginationInfo">0 items</div>
+          <div class="pagination-controls">
+            <label class="page-size-label">
+              Rows:
+              <select id="pageSizeSelect" class="input-control input-compact">
+                <option value="50">50</option>
+                <option value="100" selected>100</option>
+                <option value="250">250</option>
+                <option value="500">500</option>
+              </select>
+            </label>
+            <button id="pageFirstBtn" class="btn btn-secondary btn-xs" type="button" title="First page">&laquo;</button>
+            <button id="pagePrevBtn" class="btn btn-secondary btn-xs" type="button">&lsaquo; Prev</button>
+            <span class="page-indicator" id="pageIndicator">Page 1 / 1</span>
+            <button id="pageNextBtn" class="btn btn-secondary btn-xs" type="button">Next &rsaquo;</button>
+            <button id="pageLastBtn" class="btn btn-secondary btn-xs" type="button" title="Last page">&raquo;</button>
+          </div>
+        </div>
       </section>
     </main>
   </div>
@@ -223,11 +263,25 @@
   <div id="settingsModal" class="modal-backdrop" hidden>
     <div class="modal modal-lg" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle">
       <div class="modal-header">
-        <h2 id="settingsModalTitle">Configuration — Folders, qBittorrent &amp; Radarr/Sonarr</h2>
+        <h2 id="settingsModalTitle">Configuration</h2>
         <button class="modal-close" id="closeSettingsBtn" type="button" aria-label="Close">&times;</button>
       </div>
+      <div class="settings-tabs" id="settingsTabBar" role="tablist">
+        <button class="settings-tab-btn active" data-settings-tab="folders" type="button" role="tab">
+          Folders <span class="tab-count" id="settingsCountFolders">0</span>
+        </button>
+        <button class="settings-tab-btn" data-settings-tab="qbit" type="button" role="tab">
+          qBittorrent <span class="tab-count" id="settingsCountQbit">0</span>
+        </button>
+        <button class="settings-tab-btn" data-settings-tab="arr" type="button" role="tab">
+          Radarr / Sonarr <span class="tab-count" id="settingsCountArr">0</span>
+        </button>
+        <button class="settings-tab-btn" data-settings-tab="filters" type="button" role="tab">
+          Scan Filters
+        </button>
+      </div>
       <div class="modal-body">
-        <div class="settings-section">
+        <div class="settings-section" data-settings-panel="folders">
           <div class="section-head">
             <div>
               <h3>Folders to Compare</h3>
@@ -241,7 +295,7 @@
           <div id="foldersEditorList" class="editor-list"></div>
         </div>
 
-        <div class="settings-section">
+        <div class="settings-section" data-settings-panel="qbit" hidden>
           <div class="section-head">
             <div>
               <h3>qBittorrent Instances</h3>
@@ -254,7 +308,7 @@
           <div id="qbitEditorList" class="editor-list"></div>
         </div>
 
-        <div class="settings-section">
+        <div class="settings-section" data-settings-panel="arr" hidden>
           <div class="section-head">
             <div>
               <h3>Radarr &amp; Sonarr Instances</h3>
@@ -268,7 +322,7 @@
           <div id="arrEditorList" class="editor-list"></div>
         </div>
 
-        <div class="settings-section">
+        <div class="settings-section" data-settings-panel="filters" hidden>
           <div class="section-head">
             <div>
               <h3>Scan Filters</h3>
@@ -347,6 +401,13 @@
               <option value="auto">Auto (Arr decides — hardlinks tracked downloads, may MOVE untracked files)</option>
               <option value="move">Move (relocates file into Arr library &amp; removes original path)</option>
             </select>
+          </div>
+          <div id="qbitRelocateOptionRow" class="relocate-option-box" hidden>
+            <label>
+              <input type="checkbox" id="relocateQbitAfterMoveCheckbox" checked />
+              <span>Also update qBittorrent save path &amp; filename after Move so single-file torrents keep seeding</span>
+            </label>
+            <div id="qbitRelocateSummary" class="relocate-option-hint"></div>
           </div>
           <label style="margin-top: 8px;">
             <input type="checkbox" id="forceManualImportCheckbox" />

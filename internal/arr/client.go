@@ -465,27 +465,7 @@ func (idx *Index) FindTitleMatches(filename, torrentName string) []ArrTitleMatch
 }
 
 func ToRemotePath(localPath string, mappings []config.PathMapping) string {
-	norm := qbit.NormalizeSlashPath(localPath)
-	for _, m := range mappings {
-		remote := qbit.NormalizeSlashPath(m.RemotePrefix)
-		local := qbit.NormalizeSlashPath(m.LocalPrefix)
-		if local == "" {
-			continue
-		}
-		if norm == local {
-			return remote
-		}
-		if strings.HasPrefix(norm, local+"/") {
-			suffix := norm[len(local):]
-			return qbit.NormalizeSlashPath(remote + suffix)
-		}
-		if runtime.GOOS == "windows" && len(norm) > len(local) &&
-			strings.EqualFold(norm[:len(local)+1], local+"/") {
-			suffix := norm[len(local):]
-			return qbit.NormalizeSlashPath(remote + suffix)
-		}
-	}
-	return norm
+	return qbit.ToRemotePath(localPath, mappings)
 }
 
 type systemStatusJSON struct {

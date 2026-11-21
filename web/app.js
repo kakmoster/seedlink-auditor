@@ -17,8 +17,13 @@
     seedingFilter: "ALL",
     arrFilter: "ALL",
     folderFilter: "ALL",
+    sortBy: "default",
+    page: 1,
+    pageSize: 100,
     selectedGroupIds: new Set(),
+    expandedGroupIds: new Set(),
     pendingArrRefreshGroups: new Set(),
+    activeSettingsTab: "folders",
     scanEpoch: 0,
     pickerTargetIndex: null,
     pickerCurrentPath: "",
@@ -231,11 +236,31 @@
     $("tabCountOnlyA").textContent = String(s.only_in_a_count);
   }
 
+  function sortGroups(list, sortBy) {
+    if (!sortBy || sortBy === "default") return list;
+    const copy = list.slice();
+    copy.sort((a, b) => {
+      if (sortBy === "reclaim_desc") {
+        if ((b.reclaimable_bytes || 0) !== (a.reclaimable_bytes || 0)) {
+          return (b.reclaimable_bytes || 0) - (a.reclaimable_bytes || 0);
+        }
+      } else if (sortBy === "size_desc") {
+        if ((b.size || 0) !== (a.size || 0)) {
+          return (b.size || 0) - (a.size || 0);
+        }
+      } else if (sortBy === "name_desc") {
+        return String(b.filename || "").localeCompare(String(a.filename || ""), undefined, { sensitivity: "base" });
+      }
+      return String(a.filename || "").localeCompare(String(b.filename || ""), undefined, { sensitivity: "base" });
+    });
+    return copy;
+  }
+
   function getFilteredGroups() {
     if (!state.scan || !Array.isArray(state.scan.groups)) return [];
     const q = state.search.trim().toLowerCase();
 
-    return state.scan.groups.filter((grp) => {
+    const filtered = state.scan.groups.filter((grp) => {
       if (state.activeTab === "ARR_ISSUE") {
         if (!grp.has_arr_issue) return false;
       } else if (state.activeTab === "TRACKER_ISSUE") {
@@ -283,6 +308,7 @@
 
       return true;
     });
+    return sortGroups(filtered, state.sortBy);
   }
 
   function renderStatusBadge(grp) {
@@ -389,90 +415,211 @@
     return m.year > 0 ? `${m.title} (${m.year})` : m.title;
   }
 
+  function renderGroupDetailRow(grp) {
+    const missingAHtml =
+      grp.status === "ORPHANED_IN_B"
+        ? `<div class="missing-in-a">Missing from Folder A (original deleted)</div>`
+        : "";
+
+    const folderHtml =
+      missingAHtml +
+      grp.folder_a_files.map((f) => renderFolderFileBox(f, "Folder A")).join("") +
+      grp.folder_b_files.map((f) => renderFolderFileBox(f, "Folder B")).join("");
+
+    const torrentsHtml =
+      grp.torrents.length === 0
+        ? `<div class="torrent-sub">Not matched in any configured qBittorrent instance</div>`
+        : grp.torrents
+            .map((t) => {
+              const hasHealthIssue = Boolean(t.tracker_health);
+              const healthBadge = hasHealthIssue
+                ? `<span class="status-pill pill-error pill-inline">${escapeHtml(trackerHealthLabel(t.tracker_health))}</span>`
+                : "";
+              const fileCountBadge = t.torrent_file_count > 0
+                ? `<span class="nlink-badge">${t.torrent_file_count === 1 ? "1 file" : `${escapeHtml(t.torrent_file_count)} files`}</span>`
+                : "";
+              const msgHtml = t.tracker_msg
+                ? `<div class="tracker-error-msg">${escapeHtml(t.tracker_msg)}</div>`
+                : "";
+              return `
+            <div class="torrent-item ${hasHealthIssue ? "has-error" : ""}">
+              <div class="torrent-top">
+                <span class="instance-badge">${escapeHtml(t.instance_name)}</span>
+                ${t.tracker_host ? `<span class="tracker-badge">${escapeHtml(t.tracker_host)}</span>` : ""}
+                <span class="nlink-badge">${escapeHtml(t.state)}</span>
+                ${fileCountBadge}
+                ${healthBadge}
+              </div>
+              <div class="torrent-name">${escapeHtml(t.torrent_name)}</div>
+              ${msgHtml}
+              <div class="torrent-sub">Ratio: ${Number(t.ratio || 0).toFixed(2)} • Match: ${escapeHtml(t.match_type)} • Save: ${escapeHtml(t.save_path || "")}</div>
+            </div>`;
+            })
+            .join("");
+
+    const arrMatches = grp.arr_matches || [];
+    const arrHtml =
+      grp.arr_summary === "UNCONFIGURED"
+        ? `<div class="torrent-sub">Configure Radarr or Sonarr in Settings</div>`
+        : arrMatches.length === 0
+          ? `<div class="torrent-sub">No matching reference found</div>`
+          : arrMatches
+              .map((m) => {
+                const isIssue = m.can_import || m.can_rescan;
+                const monLabel = m.monitored ? "Monitored" : "Unmonitored";
+                return `
+              <div class="arr-item ${isIssue ? "has-issue" : ""}">
+                <div class="torrent-top">
+                  <span class="arr-type-badge">${escapeHtml(m.app_type)}</span>
+                  <span class="instance-badge">${escapeHtml(m.instance_name)}</span>
+                  <span class="nlink-badge">${monLabel}</span>
+                </div>
+                <div class="torrent-name">${escapeHtml(renderArrTitle(m))}</div>
+                ${
+                  m.existing_file_name
+                    ? `<div class="torrent-sub">Arr already has another file:</div><div class="arr-existing-file" title="${escapeHtml(m.existing_file_path || m.existing_file_name)}">${escapeHtml(m.existing_file_name)}</div>`
+                    : m.status_message
+                      ? `<div class="${isIssue ? "arr-msg" : "torrent-sub"}">${escapeHtml(m.status_message)}</div>`
+                      : ""
+                }
+                ${m.root_path ? `<div class="torrent-sub" title="${escapeHtml(m.root_path)}">Library: ${escapeHtml(m.root_path)}</div>` : ""}
+              </div>`;
+              })
+              .join("");
+
+    return `
+      <tr class="detail-row" data-detail-for="${escapeHtml(grp.id)}">
+        <td colspan="7">
+          <div class="detail-panel">
+            <div class="detail-grid">
+              <div>
+                <div class="detail-col-title">Disk Locations &amp; Inodes</div>
+                ${folderHtml}
+              </div>
+              <div>
+                <div class="detail-col-title">qBittorrent (${grp.torrents.length})</div>
+                ${torrentsHtml}
+              </div>
+              <div>
+                <div class="detail-col-title">Radarr / Sonarr (${arrMatches.length})</div>
+                ${arrHtml}
+              </div>
+            </div>
+          </div>
+        </td>
+      </tr>
+    `;
+  }
+
+  function formatCompactFolders(grp) {
+    const seen = new Set();
+    const chips = [];
+    for (const f of grp.folder_a_files || []) {
+      const k = `A:${f.folder_label}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      chips.push(`<span class="mini-chip mini-chip-primary" title="Folder A: ${escapeHtml(f.abs_path)}">${escapeHtml(f.folder_label)}</span>`);
+    }
+    for (const f of grp.folder_b_files || []) {
+      const k = `B:${f.folder_label}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      chips.push(`<span class="mini-chip" title="Folder B: ${escapeHtml(f.abs_path)}">${escapeHtml(f.folder_label)}</span>`);
+    }
+    const maxNlink = Math.max(0, ...[...(grp.folder_a_files || []), ...(grp.folder_b_files || [])].map((f) => f.nlink || 0));
+    const nlinkTag = maxNlink > 0 ? `<span class="nlink-badge">nlink:${maxNlink}</span>` : "";
+    return `<div class="cell-badges">${chips.join("")}${nlinkTag}</div>`;
+  }
+
+  function formatCompactQbitSummary(grp) {
+    const list = grp.torrents || [];
+    if (list.length === 0) {
+      return `<div class="cell-sub-trunc">Not in qBit</div>`;
+    }
+    if (list.length === 1) {
+      const t = list[0];
+      const msg = t.tracker_msg ? ` • ${t.tracker_msg}` : "";
+      const summary = `${t.instance_name} • ${t.tracker_host || t.state} • R:${Number(t.ratio || 0).toFixed(2)}${msg}`;
+      return `<div class="cell-sub-trunc" title="${escapeHtml(t.torrent_name)}">${escapeHtml(summary)}</div>`;
+    }
+    const unregCount = list.filter((t) => t.tracker_health === "UNREGISTERED").length;
+    const errCount = list.filter((t) => Boolean(t.tracker_health) && t.tracker_health !== "UNREGISTERED").length;
+    const issueParts = [];
+    if (unregCount > 0) issueParts.push(`${unregCount} unreg`);
+    if (errCount > 0) issueParts.push(`${errCount} err`);
+    const hosts = [...new Set(list.map((t) => t.tracker_host).filter(Boolean))].slice(0, 2).join(", ");
+    const extra = issueParts.length > 0 ? ` (${issueParts.join(", ")})` : hosts ? ` • ${hosts}` : "";
+    return `<div class="cell-sub-trunc">${list.length} torrents${escapeHtml(extra)}</div>`;
+  }
+
+  function formatCompactArrSummary(grp) {
+    const list = grp.arr_matches || [];
+    if (grp.arr_summary === "UNCONFIGURED") {
+      return `<div class="cell-sub-trunc">Not configured</div>`;
+    }
+    if (list.length === 0) {
+      return `<div class="cell-sub-trunc">No match</div>`;
+    }
+    const primary = list[0];
+    if (primary.existing_file_name) {
+      return `<div class="cell-sub-trunc" title="Arr already has: ${escapeHtml(primary.existing_file_path || primary.existing_file_name)}">Has: ${escapeHtml(primary.existing_file_name)}</div>`;
+    }
+    const label = `${primary.instance_name}: ${renderArrTitle(primary)}`;
+    return `<div class="cell-sub-trunc" title="${escapeHtml(primary.status_message || label)}">${escapeHtml(label)}</div>`;
+  }
+
+  function updatePaginationUi(totalCount, startIdx, endIdx, totalPages, pageGroups) {
+    const bar = $("paginationBar");
+    if (totalCount === 0) {
+      bar.hidden = true;
+    } else {
+      bar.hidden = false;
+      $("paginationInfo").textContent = `Showing ${(startIdx + 1).toLocaleString()}\u2013${endIdx.toLocaleString()} of ${totalCount.toLocaleString()} item(s)`;
+      $("pageIndicator").textContent = `Page ${state.page} / ${totalPages}`;
+      $("pageFirstBtn").disabled = state.page <= 1;
+      $("pagePrevBtn").disabled = state.page <= 1;
+      $("pageNextBtn").disabled = state.page >= totalPages;
+      $("pageLastBtn").disabled = state.page >= totalPages;
+    }
+
+    const expandBtn = $("expandPageBtn");
+    if (expandBtn) {
+      const anyPageExpanded = pageGroups.length > 0 && pageGroups.every((g) => state.expandedGroupIds.has(g.id));
+      expandBtn.textContent = anyPageExpanded ? "Collapse Page" : "Expand Page";
+      expandBtn.disabled = pageGroups.length === 0;
+    }
+  }
+
   function renderTable() {
     const tbody = $("auditTableBody");
     const filtered = getFilteredGroups();
 
     if (!state.scan) {
-      tbody.innerHTML = `<tr><td colspan="7" class="empty-table-cell">No scan data yet. Open <strong>Settings (Folders &amp; qBit)</strong> to add your folders and click <strong>Scan Now</strong>.</td></tr>`;
-      updateSelectionControls([]);
+      tbody.innerHTML = `<tr><td colspan="7" class="empty-table-cell">No scan data yet. Open <strong>Settings</strong> to add your folders and click <strong>Scan Now</strong>.</td></tr>`;
+      updatePaginationUi(0, 0, 0, 1, []);
+      updateSelectionControls([], []);
       return;
     }
 
     if (filtered.length === 0) {
       tbody.innerHTML = `<tr><td colspan="7" class="empty-table-cell">No files match the current filter criteria.</td></tr>`;
-      updateSelectionControls([]);
+      updatePaginationUi(0, 0, 0, 1, []);
+      updateSelectionControls([], []);
       return;
     }
 
-    tbody.innerHTML = filtered
+    const totalPages = Math.max(1, Math.ceil(filtered.length / state.pageSize));
+    if (state.page > totalPages) state.page = totalPages;
+    if (state.page < 1) state.page = 1;
+    const startIdx = (state.page - 1) * state.pageSize;
+    const endIdx = Math.min(filtered.length, startIdx + state.pageSize);
+    const pageGroups = filtered.slice(startIdx, endIdx);
+
+    tbody.innerHTML = pageGroups
       .map((grp) => {
         const checked = state.selectedGroupIds.has(grp.id) ? "checked" : "";
-        const missingAHtml =
-          grp.status === "ORPHANED_IN_B"
-            ? `<div class="missing-in-a">Missing from Folder A (original deleted)</div>`
-            : "";
-
-        const folderHtml =
-          missingAHtml +
-          grp.folder_a_files.map((f) => renderFolderFileBox(f, "Folder A")).join("") +
-          grp.folder_b_files.map((f) => renderFolderFileBox(f, "Folder B")).join("");
-
-        const torrentsHtml =
-          grp.torrents.length === 0
-            ? `<div class="torrent-sub">Not matched in any configured qBittorrent instance</div>`
-            : grp.torrents
-                .map((t) => {
-                  const hasHealthIssue = Boolean(t.tracker_health);
-                  const healthBadge = hasHealthIssue
-                    ? `<span class="status-pill pill-error pill-inline">${escapeHtml(trackerHealthLabel(t.tracker_health))}</span>`
-                    : "";
-                  const msgHtml = t.tracker_msg
-                    ? `<div class="tracker-error-msg">${escapeHtml(t.tracker_msg)}</div>`
-                    : "";
-                  return `
-                <div class="torrent-item ${hasHealthIssue ? "has-error" : ""}">
-                  <div class="torrent-top">
-                    <span class="instance-badge">${escapeHtml(t.instance_name)}</span>
-                    ${t.tracker_host ? `<span class="tracker-badge">${escapeHtml(t.tracker_host)}</span>` : ""}
-                    <span class="nlink-badge">${escapeHtml(t.state)}</span>
-                    ${healthBadge}
-                  </div>
-                  <div class="torrent-name">${escapeHtml(t.torrent_name)}</div>
-                  ${msgHtml}
-                  <div class="torrent-sub">Ratio: ${Number(t.ratio || 0).toFixed(2)} • Match: ${escapeHtml(t.match_type)}</div>
-                </div>`;
-                })
-                .join("");
-
+        const isExpanded = state.expandedGroupIds.has(grp.id);
         const arrMatches = grp.arr_matches || [];
-        const arrHtml =
-          grp.arr_summary === "UNCONFIGURED"
-            ? `<div class="torrent-sub">Configure Radarr or Sonarr in Settings</div>`
-            : arrMatches.length === 0
-              ? `<div class="torrent-sub">No matching reference found</div>`
-              : arrMatches
-                  .map((m) => {
-                    const isIssue = m.can_import || m.can_rescan;
-                    const monLabel = m.monitored ? "Monitored" : "Unmonitored";
-                    return `
-                  <div class="arr-item ${isIssue ? "has-issue" : ""}">
-                    <div class="torrent-top">
-                      <span class="arr-type-badge">${escapeHtml(m.app_type)}</span>
-                      <span class="instance-badge">${escapeHtml(m.instance_name)}</span>
-                      <span class="nlink-badge">${monLabel}</span>
-                    </div>
-                    <div class="torrent-name">${escapeHtml(renderArrTitle(m))}</div>
-                    ${
-                      m.existing_file_name
-                        ? `<div class="torrent-sub">Arr already has another file:</div><div class="arr-existing-file" title="${escapeHtml(m.existing_file_path || m.existing_file_name)}">${escapeHtml(m.existing_file_name)}</div>`
-                        : m.status_message
-                          ? `<div class="${isIssue ? "arr-msg" : "torrent-sub"}">${escapeHtml(m.status_message)}</div>`
-                          : ""
-                    }
-                  </div>`;
-                  })
-                  .join("");
 
         const reclaimClass =
           grp.reclaimable_bytes > 0
@@ -484,97 +631,126 @@
         const actionBtns = [];
         if (arrMatches.some((m) => m.can_import)) {
           actionBtns.push(
-            `<button class="btn btn-amber btn-xs row-arr-import" data-group-id="${escapeHtml(grp.id)}" type="button" title="Tell Radarr/Sonarr to import this file into its library folder">Import to Arr</button>`
+            `<button class="btn btn-amber btn-xs row-arr-import" data-group-id="${escapeHtml(grp.id)}" type="button" title="Tell Radarr/Sonarr to import this file into its library folder">Import</button>`
           );
         }
         if (arrMatches.some((m) => m.can_rescan)) {
           actionBtns.push(
-            `<button class="btn btn-secondary btn-xs row-arr-rescan" data-group-id="${escapeHtml(grp.id)}" type="button" title="Scan Arr's existing library folder to link this file without moving it">Rescan in Arr</button>`
+            `<button class="btn btn-secondary btn-xs row-arr-rescan" data-group-id="${escapeHtml(grp.id)}" type="button" title="Scan Arr's existing library folder to link this file without moving it">Rescan</button>`
           );
         }
         const erroredTorrents = grp.torrents.filter((t) => Boolean(t.tracker_health));
         if (erroredTorrents.length > 0) {
-          const errBtnText = grp.has_unregistered ? "Delete Unregistered" : "Delete Errored";
+          const errBtnText = grp.has_unregistered ? "Del Unreg" : "Del Err";
+          const errTitle = grp.has_unregistered
+            ? "Remove unregistered torrent(s) from qBittorrent (healthy torrents stay)"
+            : "Remove errored torrent(s) from qBittorrent (healthy torrents stay)";
           actionBtns.push(
-            `<button class="btn btn-outline-danger btn-xs row-delete-errored-torrent" data-group-id="${escapeHtml(grp.id)}" type="button" title="Remove errored/unregistered torrent(s) from qBittorrent (healthy torrents stay)">${errBtnText}</button>`
+            `<button class="btn btn-outline-danger btn-xs row-delete-errored-torrent" data-group-id="${escapeHtml(grp.id)}" type="button" title="${errTitle}">${errBtnText}</button>`
           );
         }
         if (grp.torrents.length > 0) {
           actionBtns.push(
-            `<button class="btn btn-danger btn-xs row-delete-torrent" data-group-id="${escapeHtml(grp.id)}" type="button" title="Remove matching torrent(s) from qBittorrent (with optional data file delete)">Delete Torrent</button>`
+            `<button class="btn btn-danger btn-xs row-delete-torrent" data-group-id="${escapeHtml(grp.id)}" type="button" title="Remove matching torrent(s) from qBittorrent (with optional data file delete)">Del qBit</button>`
           );
         }
         if (grp.can_hardlink && grp.hardlink_pairs.length > 0) {
           actionBtns.push(
-            `<button class="btn btn-amber btn-xs row-hardlink" data-group-id="${escapeHtml(grp.id)}" type="button" title="Replace duplicate copies with hardlinks to reclaim space">Make Hardlink</button>`
+            `<button class="btn btn-amber btn-xs row-hardlink" data-group-id="${escapeHtml(grp.id)}" type="button" title="Replace duplicate copies with hardlinks to reclaim space">Hardlink</button>`
           );
         }
         if (grp.all_paths.length > 0 && (grp.seeding_summary === "UNTRACKED" || grp.status === "ORPHANED_IN_B")) {
           actionBtns.push(
-            `<button class="btn btn-outline-danger btn-xs row-delete-file" data-group-id="${escapeHtml(grp.id)}" type="button" title="Delete file(s) directly from disk">Delete File</button>`
+            `<button class="btn btn-outline-danger btn-xs row-delete-file" data-group-id="${escapeHtml(grp.id)}" type="button" title="Delete file(s) directly from disk">Del File</button>`
           );
         }
         actionBtns.push(
-          `<button class="btn btn-secondary btn-xs row-refresh" data-group-id="${escapeHtml(grp.id)}" type="button" title="Refresh disk, qBittorrent & Radarr/Sonarr status for this item">Refresh</button>`
+          `<button class="btn btn-secondary btn-xs row-refresh" data-group-id="${escapeHtml(grp.id)}" type="button" title="Refresh disk, qBittorrent & Radarr/Sonarr status for this item">&#8635;</button>`
         );
 
         const arrSyncHtml = state.pendingArrRefreshGroups.has(grp.id)
-          ? `<div class="arr-sync-badge">Syncing with Radarr/Sonarr...</div>`
+          ? `<div class="arr-sync-badge">Syncing Arr...</div>`
           : "";
 
-        return `
-          <tr data-group-id="${escapeHtml(grp.id)}">
+        const mainRowHtml = `
+          <tr class="main-row ${isExpanded ? "is-expanded" : ""}" data-group-id="${escapeHtml(grp.id)}">
             <td class="col-check">
-              <input type="checkbox" class="row-checkbox" data-group-id="${escapeHtml(grp.id)}" ${checked} />
+              <div class="row-check-wrap">
+                <input type="checkbox" class="row-checkbox" data-group-id="${escapeHtml(grp.id)}" ${checked} />
+                <button class="row-expand-btn ${isExpanded ? "expanded" : ""}" data-group-id="${escapeHtml(grp.id)}" type="button" title="${isExpanded ? "Collapse details" : "Expand full paths, torrents & Arr details"}" aria-label="Toggle row details">&#9656;</button>
+              </div>
             </td>
             <td class="col-file">
-              <div class="file-name">${escapeHtml(grp.filename)}</div>
+              <div class="file-name" title="${escapeHtml(grp.filename)}">${escapeHtml(grp.filename)}</div>
               <div class="file-meta">
                 <span>${formatBytes(grp.size)}</span>
                 <span>${escapeHtml(grp.ext || "file")}</span>
               </div>
             </td>
             <td class="col-folders">
-              ${renderStatusBadge(grp)}
-              ${folderHtml}
+              <div class="cell-stack">
+                ${renderStatusBadge(grp)}
+                ${formatCompactFolders(grp)}
+              </div>
             </td>
             <td class="col-qbit">
-              ${renderSeedingBadge(grp)}
-              ${torrentsHtml}
+              <div class="cell-stack">
+                ${renderSeedingBadge(grp)}
+                ${formatCompactQbitSummary(grp)}
+              </div>
             </td>
             <td class="col-arr">
-              ${renderArrBadge(grp.arr_summary)}
-              ${arrHtml}
-              ${arrSyncHtml}
+              <div class="cell-stack">
+                ${renderArrBadge(grp.arr_summary)}
+                ${formatCompactArrSummary(grp)}
+                ${arrSyncHtml}
+              </div>
             </td>
             <td class="col-reclaim">
-              <div class="reclaim-bytes ${reclaimClass}">${formatBytes(grp.reclaimable_bytes)}</div>
+              <div class="reclaim-bytes ${reclaimClass}">${grp.reclaimable_bytes > 0 ? formatBytes(grp.reclaimable_bytes) : "—"}</div>
               ${
                 grp.status === "DUPLICATE_COPY" && !grp.can_hardlink
-                  ? `<div class="torrent-sub">Cross-device (cannot link)</div>`
+                  ? `<div class="cell-sub-trunc" title="Cross-device (cannot hardlink)">Cross-dev</div>`
                   : ""
               }
             </td>
             <td class="col-actions">
-              <div class="row-actions">${actionBtns.join("") || `<span class="torrent-sub">—</span>`}</div>
+              <div class="row-actions">${actionBtns.join("")}</div>
             </td>
           </tr>
         `;
+
+        return isExpanded ? mainRowHtml + renderGroupDetailRow(grp) : mainRowHtml;
       })
       .join("");
 
-    updateSelectionControls(filtered);
+    updatePaginationUi(filtered.length, startIdx, endIdx, totalPages, pageGroups);
+    updateSelectionControls(filtered, pageGroups);
   }
 
-  function updateSelectionControls(filteredRows) {
-    const visibleIds = new Set(filteredRows.map((g) => g.id));
-    const selectedVisible = [...state.selectedGroupIds].filter((id) => visibleIds.has(id));
+  function updateSelectionControls(filteredRows, pageRows = null) {
+    const currentPageRows = pageRows || filteredRows;
+    const pageIds = new Set(currentPageRows.map((g) => g.id));
+    const selectedOnPage = [...state.selectedGroupIds].filter((id) => pageIds.has(id));
     const selectAll = $("selectAllCheckbox");
-    selectAll.checked = filteredRows.length > 0 && selectedVisible.length === filteredRows.length;
-    selectAll.indeterminate = selectedVisible.length > 0 && selectedVisible.length < filteredRows.length;
+    selectAll.checked = currentPageRows.length > 0 && selectedOnPage.length === currentPageRows.length;
+    selectAll.indeterminate = selectedOnPage.length > 0 && selectedOnPage.length < currentPageRows.length;
 
     const selectedGroups = getSelectedGroups();
-    $("selectionBadge").textContent = `${selectedGroups.length} selected`;
+    $("bulkBar").hidden = selectedGroups.length === 0;
+    $("selectionBadge").textContent = `${selectedGroups.length.toLocaleString()} selected`;
+
+    const allFilteredIds = new Set(filteredRows.map((g) => g.id));
+    const selectedInFilter = [...state.selectedGroupIds].filter((id) => allFilteredIds.has(id));
+    const selAllMatchBtn = $("selectAllMatchingBtn");
+    if (selAllMatchBtn) {
+      if (selectedGroups.length > 0 && filteredRows.length > currentPageRows.length && selectedInFilter.length < filteredRows.length) {
+        selAllMatchBtn.hidden = false;
+        selAllMatchBtn.textContent = `Select all ${filteredRows.length.toLocaleString()} matching`;
+      } else {
+        selAllMatchBtn.hidden = true;
+      }
+    }
 
     const hasArrFix = selectedGroups.some((g) => (g.arr_matches || []).some((m) => m.can_import || m.can_rescan));
     const hasTorrents = selectedGroups.some((g) => g.torrents.length > 0);
@@ -616,7 +792,9 @@
     state.pendingArrRefreshGroups.clear();
     try {
       state.scan = await apiFetch("/api/scan", { method: "POST" });
+      state.page = 1;
       state.selectedGroupIds.clear();
+      state.expandedGroupIds.clear();
       renderAll();
       showToast(
         `Scan complete: ${state.scan.summary.total_files_scanned} files analyzed (${formatBytes(state.scan.summary.total_reclaimable_bytes)} reclaimable).`,
@@ -670,24 +848,50 @@
     return [...paths];
   }
 
-  async function refreshGroupsInPlace(groupIds, waitDeletedPaths = [], includeArr = true) {
+  function buildQbitRelocatePreview(groups) {
+    const eligible = [];
+    const skippedMulti = [];
+    const seen = new Set();
+    for (const g of groups || []) {
+      for (const t of g.torrents || []) {
+        const k = `${t.instance_id}::${t.torrent_hash}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        if ((t.torrent_file_count || 0) === 1) {
+          eligible.push({ group_id: g.id, torrent: t });
+        } else {
+          skippedMulti.push({ group_id: g.id, torrent: t });
+        }
+      }
+    }
+    return { eligible, skippedMulti };
+  }
+
+  async function refreshGroupsInPlace(groupIds, waitDeletedPaths = [], includeArr = true, extraQbitHashes = null) {
     const uniqueIds = [...new Set((groupIds || []).filter(Boolean))];
     if (!state.scan || uniqueIds.length === 0) return null;
 
     const epoch = state.scanEpoch;
+    const bodyObj = {
+      group_ids: uniqueIds,
+      wait_for_deleted_paths: waitDeletedPaths,
+      include_arr: includeArr,
+    };
+    if (extraQbitHashes && Object.keys(extraQbitHashes).length > 0) {
+      bodyObj.extra_qbit_hashes = extraQbitHashes;
+    }
+
     const res = await apiFetch("/api/scan/refresh-groups", {
       method: "POST",
-      body: JSON.stringify({
-        group_ids: uniqueIds,
-        wait_for_deleted_paths: waitDeletedPaths,
-        include_arr: includeArr,
-      }),
+      body: JSON.stringify(bodyObj),
     });
     if (epoch !== state.scanEpoch) return null;
 
     if (res.full_scan) {
       state.scan = res.full_scan;
+      state.page = 1;
       state.selectedGroupIds.clear();
+      state.expandedGroupIds.clear();
       state.pendingArrRefreshGroups.clear();
       renderAll();
       return res;
@@ -698,6 +902,7 @@
 
     for (const id of removedSet) {
       state.selectedGroupIds.delete(id);
+      state.expandedGroupIds.delete(id);
       state.pendingArrRefreshGroups.delete(id);
     }
 
@@ -714,7 +919,7 @@
     return res;
   }
 
-  async function pollArrCommandsAndRefresh(commands, groupIds) {
+  async function pollArrCommandsAndRefresh(commands, groupIds, relocatePlan = null) {
     const uniqueIds = [...new Set((groupIds || []).filter(Boolean))];
     if (uniqueIds.length === 0) return;
 
@@ -747,8 +952,60 @@
       for (const id of uniqueIds) {
         state.pendingArrRefreshGroups.delete(id);
       }
-      await refreshGroupsInPlace(uniqueIds, [], true);
+      const refRes = await refreshGroupsInPlace(uniqueIds, [], true);
       if (epoch !== state.scanEpoch) return;
+
+      if (relocatePlan && relocatePlan.size > 0 && refRes && !refRes.full_scan) {
+        const relocateItems = [];
+        const extraHashesByInst = {};
+        const seenHash = new Set();
+
+        for (const updatedGrp of refRes.updated_groups || []) {
+          const plan = relocatePlan.get(updatedGrp.id);
+          if (!plan) continue;
+          const diskSet = new Set((updatedGrp.all_paths || []).map((p) => String(p).toLowerCase()));
+          const imported = (updatedGrp.arr_matches || []).find(
+            (m) => m.match_kind === "imported" && m.file_path && diskSet.has(String(m.file_path).toLowerCase())
+          );
+          const candidatePath =
+            (imported && imported.file_path) ||
+            (updatedGrp.folder_a_files && updatedGrp.folder_a_files[0] && updatedGrp.folder_a_files[0].abs_path) ||
+            (updatedGrp.all_paths && updatedGrp.all_paths[0]) ||
+            "";
+
+          if (!candidatePath || plan.oldPaths.has(String(candidatePath).toLowerCase())) {
+            continue;
+          }
+          for (const t of plan.torrents) {
+            const hk = `${t.instance_id}::${t.torrent_hash}`;
+            if (seenHash.has(hk)) continue;
+            seenHash.add(hk);
+            relocateItems.push({
+              instance_id: t.instance_id,
+              torrent_hash: t.torrent_hash,
+              new_local_path: candidatePath,
+            });
+            if (!extraHashesByInst[t.instance_id]) extraHashesByInst[t.instance_id] = [];
+            extraHashesByInst[t.instance_id].push(t.torrent_hash);
+          }
+        }
+
+        if (relocateItems.length > 0) {
+          const relRes = await apiFetch("/api/actions/qbit-relocate", {
+            method: "POST",
+            body: JSON.stringify({ items: relocateItems, dry_run: false }),
+          });
+          if (epoch !== state.scanEpoch) return;
+          await refreshGroupsInPlace(uniqueIds, [], true, extraHashesByInst);
+          const relErrs = (relRes.errors || []).length;
+          showToast(
+            `Arr sync done & relocated ${relRes.relocated_count} single-file torrent(s) in qBittorrent${relErrs > 0 ? ` (${relErrs} error/skipped)` : ""}.`,
+            relErrs > 0 && relRes.relocated_count === 0 ? "error" : "success"
+          );
+          return;
+        }
+      }
+
       showToast(
         timedOut
           ? "Radarr/Sonarr sync still running — refreshed current status."
@@ -1046,16 +1303,42 @@
         const hitsPrimarySource = (payload.importItems || []).some((it) =>
           primaryPaths.has(String(it.local_path || "").toLowerCase())
         );
-        if (payload.import_mode !== "copy" && hasTorrents) {
+        const relocateInfo = buildQbitRelocatePreview(groups);
+        const relocateRow = $("qbitRelocateOptionRow");
+        const relocateCheck = $("relocateQbitAfterMoveCheckbox");
+        const relocateActive =
+          payload.import_mode === "move" &&
+          relocateRow &&
+          !relocateRow.hidden &&
+          relocateCheck &&
+          relocateCheck.checked &&
+          relocateInfo.eligible.length > 0;
+
+        if (payload.import_mode === "move" && relocateActive) {
+          bullets.push(
+            `After Arr finishes moving, SeedLink will stop, disable Auto TMM, update location / filename, recheck, and resume ${relocateInfo.eligible.length} eligible single-file torrent(s) in qBittorrent.`
+          );
+          if (relocateInfo.skippedMulti.length > 0) {
+            warnings.push(
+              `Warning: ${relocateInfo.skippedMulti.length} matched torrent(s) contain multiple files (or file count unavailable) and will NOT be auto-relocated in qBittorrent — moving their files may break seeding on those torrents.`
+            );
+          }
+        } else if (payload.import_mode !== "copy" && hasTorrents) {
           warnings.push(
-            `Warning: Selected item(s) are tracked/seeding in qBittorrent. With Import Mode "${payload.import_mode === "move" ? "Move" : "Auto"}", Radarr/Sonarr can rename/relocate the file into its target folder and break seeding if it moves instead of hardlinking. Switch Import Mode to "Copy / Hardlink" to keep the original path intact.`
+            `Warning: Selected item(s) are tracked/seeding in qBittorrent. With Import Mode "${payload.import_mode === "move" ? "Move" : "Auto"}", Radarr/Sonarr can rename/relocate the file into its target folder and break seeding unless relocated (or switch Import Mode to "Copy / Hardlink").`
           );
         }
         if (hitsPrimarySource) {
           if (payload.import_mode !== "copy") {
-            warnings.push(
-              "Warning: The source file is already in a Primary (Plex) folder. Moving it may relocate it into Radarr/Sonarr\u2019s target folder (shown below) and break seeding if qBittorrent points here."
-            );
+            if (!relocateActive) {
+              warnings.push(
+                "Warning: The source file is already in a Primary (Plex) folder. Moving it may relocate it into Radarr/Sonarr\u2019s target folder (shown below) and break seeding if qBittorrent points here."
+              );
+            } else {
+              warnings.push(
+                "Note: The source file is inside a Primary (Plex) folder; Arr will move it to the target library folder below and SeedLink will update qBittorrent to seed from that new path."
+              );
+            }
           } else {
             warnings.push(
               "Note: Source file sits in a Primary (Plex) folder. Copy / Hardlink will keep this original path intact while linking/copying to Arr\u2019s target library folder shown below."
@@ -1079,6 +1362,36 @@
     }
   }
 
+  function updateQbitRelocateOptionUi(type, groups, payload) {
+    const row = $("qbitRelocateOptionRow");
+    const chk = $("relocateQbitAfterMoveCheckbox");
+    const hint = $("qbitRelocateSummary");
+    if (!row || !chk || !hint) return;
+
+    const isArrImport = (type === "arr-import" || type === "arr-fix") && payload.importItems && payload.importItems.length > 0;
+    const relocateInfo = buildQbitRelocatePreview(groups);
+    const hasAnyTorrents = relocateInfo.eligible.length + relocateInfo.skippedMulti.length > 0;
+
+    if (!isArrImport || payload.import_mode !== "move" || !hasAnyTorrents) {
+      row.hidden = true;
+      return;
+    }
+
+    row.hidden = false;
+    if (relocateInfo.eligible.length === 0) {
+      chk.checked = false;
+      chk.disabled = true;
+      hint.textContent = `${relocateInfo.skippedMulti.length} matched torrent(s) contain multiple files (e.g. season pack or sample/nfo); auto-relocate only supports single-file torrents.`;
+    } else {
+      chk.disabled = false;
+      const parts = [`${relocateInfo.eligible.length} eligible single-file torrent(s) will be relocated & rechecked`];
+      if (relocateInfo.skippedMulti.length > 0) {
+        parts.push(`${relocateInfo.skippedMulti.length} multi-file torrent(s) will be skipped`);
+      }
+      hint.textContent = parts.join("; ") + ".";
+    }
+  }
+
   async function openActionModal(actionType, groups, options = {}) {
     state.pendingAction = { type: actionType, groups, options };
     const titles = {
@@ -1092,6 +1405,8 @@
     $("actionModalTitle").textContent = `${titles[actionType]} — Dry-Run Preview`;
     $("torrentDeleteOptionRow").hidden = actionType !== "delete-torrents";
     $("forceManualImportCheckbox").checked = false;
+    $("relocateQbitAfterMoveCheckbox").checked = true;
+    $("relocateQbitAfterMoveCheckbox").disabled = false;
     const arrPayload = (actionType === "arr-import" || actionType === "arr-fix")
       ? buildActionPayloadForGroups(actionType, groups)
       : null;
@@ -1113,6 +1428,7 @@
     if (!state.pendingAction) return;
     const { type, groups, options } = state.pendingAction;
     const payload = buildActionPayloadForGroups(type, groups);
+    updateQbitRelocateOptionUi(type, groups, payload);
     renderActionExplanation(type, groups, payload, options || {});
     const ro = state.config.read_only_mode;
 
@@ -1229,6 +1545,31 @@
           }
         }
 
+        const relocateRow = $("qbitRelocateOptionRow");
+        const relocateCheck = $("relocateQbitAfterMoveCheckbox");
+        if (
+          payload.import_mode === "move" &&
+          relocateRow &&
+          !relocateRow.hidden &&
+          relocateCheck &&
+          relocateCheck.checked
+        ) {
+          const relocateInfo = buildQbitRelocatePreview(groups);
+          for (const item of relocateInfo.eligible) {
+            const t = item.torrent;
+            rowsHtml.push(
+              `<div class="preview-row">QBIT RELOCATE: [${escapeHtml(t.instance_name)}] ${escapeHtml(t.torrent_name)} (1 file) &mdash; will update location/name &amp; recheck after Arr finishes</div>`
+            );
+          }
+          for (const item of relocateInfo.skippedMulti) {
+            const t = item.torrent;
+            const fc = t.torrent_file_count > 0 ? `${t.torrent_file_count} files` : "multi-file";
+            rowsHtml.push(
+              `<div class="preview-row preview-err">QBIT SKIP (${escapeHtml(fc)}): [${escapeHtml(t.instance_name)}] ${escapeHtml(t.torrent_name)}</div>`
+            );
+          }
+        }
+
         $("actionPreviewSummary").innerHTML = summaryParts.length > 0
           ? `Will send ${summaryParts.join(" and ")} to Radarr/Sonarr.`
           : "No eligible Radarr/Sonarr actions found.";
@@ -1261,6 +1602,31 @@
       const affectedIds = expandAffectedGroupIds(type, groups, payload);
       const waitDeletedPaths = collectWaitDeletedPaths(type, groups, payload);
       const triggeredCommands = [];
+      let relocatePlan = null;
+
+      if (
+        (type === "arr-import" || type === "arr-fix") &&
+        payload.import_mode === "move" &&
+        $("qbitRelocateOptionRow") &&
+        !$("qbitRelocateOptionRow").hidden &&
+        $("relocateQbitAfterMoveCheckbox") &&
+        $("relocateQbitAfterMoveCheckbox").checked &&
+        !$("relocateQbitAfterMoveCheckbox").disabled
+      ) {
+        relocatePlan = new Map();
+        for (const g of groups || []) {
+          const singleFileTorrents = (g.torrents || []).filter((t) => (t.torrent_file_count || 0) === 1);
+          if (singleFileTorrents.length === 0) continue;
+          relocatePlan.set(g.id, {
+            oldPaths: new Set((g.all_paths || []).map((p) => String(p).toLowerCase())),
+            torrents: singleFileTorrents.map((t) => ({
+              instance_id: t.instance_id,
+              torrent_hash: t.torrent_hash,
+            })),
+          });
+        }
+      }
+
       let res;
 
       if (type === "convert-hardlinks") {
@@ -1338,7 +1704,7 @@
           state.pendingArrRefreshGroups.add(id);
         }
         renderTable();
-        void pollArrCommandsAndRefresh(triggeredCommands, affectedIds);
+        void pollArrCommandsAndRefresh(triggeredCommands, affectedIds, relocatePlan);
       } else {
         const refRes = await refreshGroupsInPlace(affectedIds, waitDeletedPaths, false);
         if (refRes && !refRes.full_scan) {
@@ -1356,6 +1722,16 @@
   }
 
   // --- Settings Modal & Visual Folder Picker ---
+  function switchSettingsTab(tabName) {
+    state.activeSettingsTab = tabName || "folders";
+    document.querySelectorAll("#settingsTabBar .settings-tab-btn").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.settingsTab === state.activeSettingsTab);
+    });
+    document.querySelectorAll("[data-settings-panel]").forEach((panel) => {
+      panel.hidden = panel.dataset.settingsPanel !== state.activeSettingsTab;
+    });
+  }
+
   function openSettingsModal() {
     state.draftConfig = JSON.parse(JSON.stringify(state.config));
     state.draftConfig.folders = state.draftConfig.folders || [];
@@ -1370,10 +1746,20 @@
     $("ignoreExtInput").value = (state.draftConfig.ignore_extensions || []).join(", ");
     $("minSizeInput").value = String(state.draftConfig.min_size_bytes || 0);
     renderSettingsEditors();
+    switchSettingsTab(state.activeSettingsTab || "folders");
     $("settingsModal").hidden = false;
   }
 
   function renderSettingsEditors() {
+    if ($("settingsCountFolders")) {
+      $("settingsCountFolders").textContent = String((state.draftConfig.folders || []).length);
+    }
+    if ($("settingsCountQbit")) {
+      $("settingsCountQbit").textContent = String((state.draftConfig.qbit_instances || []).length);
+    }
+    if ($("settingsCountArr")) {
+      $("settingsCountArr").textContent = String((state.draftConfig.arr_instances || []).length);
+    }
     const foldersList = $("foldersEditorList");
     foldersList.innerHTML = state.draftConfig.folders
       .map(
@@ -1670,6 +2056,15 @@
     }
   }
 
+  function getCurrentPageSlice() {
+    const filtered = getFilteredGroups();
+    const totalPages = Math.max(1, Math.ceil(filtered.length / state.pageSize));
+    const page = Math.min(Math.max(1, state.page), totalPages);
+    const startIdx = (page - 1) * state.pageSize;
+    const pageRows = filtered.slice(startIdx, startIdx + state.pageSize);
+    return { filtered, pageRows, totalPages, page };
+  }
+
   // --- Event Binding ---
   function bindEvents() {
     $("readOnlyToggleBtn").addEventListener("click", toggleReadOnly);
@@ -1687,6 +2082,7 @@
     document.querySelectorAll("#quickTabs .tab-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
         state.activeTab = btn.dataset.tab;
+        state.page = 1;
         syncActiveTabUi();
         renderTable();
       });
@@ -1695,6 +2091,7 @@
     document.querySelectorAll("#kpiGrid .kpi-card").forEach((card) => {
       card.addEventListener("click", () => {
         state.activeTab = card.dataset.filterTab;
+        state.page = 1;
         syncActiveTabUi();
         renderTable();
       });
@@ -1702,28 +2099,84 @@
 
     $("searchInput").addEventListener("input", (e) => {
       state.search = e.target.value;
+      state.page = 1;
       renderTable();
     });
     $("seedingFilter").addEventListener("change", (e) => {
       state.seedingFilter = e.target.value;
+      state.page = 1;
       renderTable();
     });
     $("arrFilter").addEventListener("change", (e) => {
       state.arrFilter = e.target.value;
+      state.page = 1;
       renderTable();
     });
     $("folderFilter").addEventListener("change", (e) => {
       state.folderFilter = e.target.value;
+      state.page = 1;
+      renderTable();
+    });
+    $("sortSelect").addEventListener("change", (e) => {
+      state.sortBy = e.target.value;
+      state.page = 1;
+      renderTable();
+    });
+    $("pageSizeSelect").addEventListener("change", (e) => {
+      state.pageSize = Math.max(10, Number(e.target.value) || 100);
+      state.page = 1;
+      renderTable();
+    });
+    $("pageFirstBtn").addEventListener("click", () => {
+      state.page = 1;
+      renderTable();
+    });
+    $("pagePrevBtn").addEventListener("click", () => {
+      if (state.page > 1) {
+        state.page -= 1;
+        renderTable();
+      }
+    });
+    $("pageNextBtn").addEventListener("click", () => {
+      const { totalPages } = getCurrentPageSlice();
+      if (state.page < totalPages) {
+        state.page += 1;
+        renderTable();
+      }
+    });
+    $("pageLastBtn").addEventListener("click", () => {
+      const { totalPages } = getCurrentPageSlice();
+      state.page = totalPages;
+      renderTable();
+    });
+
+    $("expandPageBtn").addEventListener("click", () => {
+      const { pageRows } = getCurrentPageSlice();
+      if (pageRows.length === 0) return;
+      const allExpanded = pageRows.every((g) => state.expandedGroupIds.has(g.id));
+      for (const g of pageRows) {
+        if (allExpanded) state.expandedGroupIds.delete(g.id);
+        else state.expandedGroupIds.add(g.id);
+      }
       renderTable();
     });
 
     $("selectAllCheckbox").addEventListener("change", (e) => {
-      const filtered = getFilteredGroups();
+      const { pageRows } = getCurrentPageSlice();
       if (e.target.checked) {
-        filtered.forEach((g) => state.selectedGroupIds.add(g.id));
+        pageRows.forEach((g) => state.selectedGroupIds.add(g.id));
       } else {
-        filtered.forEach((g) => state.selectedGroupIds.delete(g.id));
+        pageRows.forEach((g) => state.selectedGroupIds.delete(g.id));
       }
+      renderTable();
+    });
+    $("selectAllMatchingBtn").addEventListener("click", () => {
+      const filtered = getFilteredGroups();
+      filtered.forEach((g) => state.selectedGroupIds.add(g.id));
+      renderTable();
+    });
+    $("clearSelectionBtn").addEventListener("click", () => {
+      state.selectedGroupIds.clear();
       renderTable();
     });
 
@@ -1733,50 +2186,69 @@
         const gid = target.dataset.groupId;
         if (target.checked) state.selectedGroupIds.add(gid);
         else state.selectedGroupIds.delete(gid);
-        updateSelectionControls(getFilteredGroups());
+        const { filtered, pageRows } = getCurrentPageSlice();
+        updateSelectionControls(filtered, pageRows);
         return;
       }
 
       const btn = target.closest("button");
-      if (!btn || !state.scan) return;
-      const gid = btn.dataset.groupId;
-      const grp = state.scan.groups.find((g) => g.id === gid);
-      if (!grp) return;
+      if (btn) {
+        if (!state.scan) return;
+        const gid = btn.dataset.groupId;
+        if (btn.classList.contains("row-expand-btn")) {
+          if (state.expandedGroupIds.has(gid)) state.expandedGroupIds.delete(gid);
+          else state.expandedGroupIds.add(gid);
+          renderTable();
+          return;
+        }
+        const grp = state.scan.groups.find((g) => g.id === gid);
+        if (!grp) return;
 
-      if (btn.classList.contains("row-arr-import")) {
-        openActionModal("arr-import", [grp]);
-      } else if (btn.classList.contains("row-arr-rescan")) {
-        openActionModal("arr-rescan", [grp]);
-      } else if (btn.classList.contains("row-delete-errored-torrent")) {
-        openActionModal("delete-torrents", [
-          { ...grp, torrents: grp.torrents.filter((t) => Boolean(t.tracker_health)) },
-        ], { erroredOnly: true });
-      } else if (btn.classList.contains("row-delete-torrent")) {
-        openActionModal("delete-torrents", [grp]);
-      } else if (btn.classList.contains("row-hardlink")) {
-        openActionModal("convert-hardlinks", [grp]);
-      } else if (btn.classList.contains("row-delete-file")) {
-        openActionModal("delete-files", [grp]);
-      } else if (btn.classList.contains("row-refresh")) {
-        btn.disabled = true;
-        btn.textContent = "...";
-        try {
-          const refRes = await refreshGroupsInPlace([grp.id], [], true);
-          if (refRes) {
-            if ((refRes.removed_group_ids || []).includes(grp.id)) {
-              showToast("Item no longer on disk — removed from list.", "info");
-            } else {
-              showToast(`Refreshed item in ${refRes.duration_ms} ms.`, "success");
+        if (btn.classList.contains("row-arr-import")) {
+          openActionModal("arr-import", [grp]);
+        } else if (btn.classList.contains("row-arr-rescan")) {
+          openActionModal("arr-rescan", [grp]);
+        } else if (btn.classList.contains("row-delete-errored-torrent")) {
+          openActionModal("delete-torrents", [
+            { ...grp, torrents: grp.torrents.filter((t) => Boolean(t.tracker_health)) },
+          ], { erroredOnly: true });
+        } else if (btn.classList.contains("row-delete-torrent")) {
+          openActionModal("delete-torrents", [grp]);
+        } else if (btn.classList.contains("row-hardlink")) {
+          openActionModal("convert-hardlinks", [grp]);
+        } else if (btn.classList.contains("row-delete-file")) {
+          openActionModal("delete-files", [grp]);
+        } else if (btn.classList.contains("row-refresh")) {
+          btn.disabled = true;
+          btn.textContent = "...";
+          try {
+            const refRes = await refreshGroupsInPlace([grp.id], [], true);
+            if (refRes) {
+              if ((refRes.removed_group_ids || []).includes(grp.id)) {
+                showToast("Item no longer on disk — removed from list.", "info");
+              } else {
+                showToast(`Refreshed item in ${refRes.duration_ms} ms.`, "success");
+              }
+            }
+          } catch (err) {
+            showToast(`Row refresh failed: ${err.message}`, "error");
+            if (btn.isConnected) {
+              btn.disabled = false;
+              btn.innerHTML = "&#8635;";
             }
           }
-        } catch (err) {
-          showToast(`Row refresh failed: ${err.message}`, "error");
-          if (btn.isConnected) {
-            btn.disabled = false;
-            btn.textContent = "Refresh";
-          }
         }
+        return;
       }
+
+      if (target.closest("input, a, select, label")) return;
+      const mainRow = target.closest("tr.main-row");
+      if (!mainRow || mainRow.closest(".detail-row")) return;
+      const gid = mainRow.dataset.groupId;
+      if (!gid) return;
+      if (state.expandedGroupIds.has(gid)) state.expandedGroupIds.delete(gid);
+      else state.expandedGroupIds.add(gid);
+      renderTable();
     });
 
     $("bulkArrFixBtn").addEventListener("click", () => {
@@ -1796,6 +2268,7 @@
     $("cancelActionBtn").addEventListener("click", () => ($("actionModal").hidden = true));
     $("deleteTorrentFilesCheckbox").addEventListener("change", refreshActionDryRun);
     $("arrImportModeSelect").addEventListener("change", refreshActionDryRun);
+    $("relocateQbitAfterMoveCheckbox").addEventListener("change", refreshActionDryRun);
     $("forceManualImportCheckbox").addEventListener("change", refreshActionDryRun);
     $("confirmActionBtn").addEventListener("click", () => executePendingAction(false));
     $("unlockAndExecuteBtn").addEventListener("click", () => executePendingAction(true));
@@ -1803,6 +2276,12 @@
     $("closeSettingsBtn").addEventListener("click", () => ($("settingsModal").hidden = true));
     $("cancelSettingsBtn").addEventListener("click", () => ($("settingsModal").hidden = true));
     $("saveSettingsBtn").addEventListener("click", saveSettingsAndScan);
+    $("settingsTabBar").addEventListener("click", (e) => {
+      const btn = e.target.closest(".settings-tab-btn");
+      if (btn && btn.dataset.settingsTab) {
+        switchSettingsTab(btn.dataset.settingsTab);
+      }
+    });
 
     $("addFolderBtn").addEventListener("click", () => {
       syncDraftFromDom();

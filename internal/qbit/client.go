@@ -58,10 +58,11 @@ type TorrentFileEntry struct {
 	TrackerHealth string  `json:"tracker_health"`
 	TrackerMsg    string  `json:"tracker_msg"`
 	SavePath      string  `json:"save_path"`
-	RelativeName  string  `json:"relative_name"`
-	MappedPath    string  `json:"mapped_path"`
-	Filename      string  `json:"-"`
-	Size          int64   `json:"size"`
+	RelativeName     string  `json:"relative_name"`
+	MappedPath       string  `json:"mapped_path"`
+	Filename         string  `json:"-"`
+	Size             int64   `json:"size"`
+	TorrentFileCount int     `json:"torrent_file_count"`
 }
 
 type InstanceReport struct {
@@ -190,6 +191,31 @@ func ApplyPathMappings(pathStr string, mappings []config.PathMapping) string {
 			strings.EqualFold(norm[:len(remote)+1], remote+"/") {
 			suffix := norm[len(remote):]
 			return NormalizeSlashPath(local + suffix)
+		}
+	}
+	return norm
+}
+
+// ToRemotePath reverse-maps a local host/container path back to an instance's remote path.
+func ToRemotePath(localPath string, mappings []config.PathMapping) string {
+	norm := NormalizeSlashPath(localPath)
+	for _, m := range mappings {
+		remote := NormalizeSlashPath(m.RemotePrefix)
+		local := NormalizeSlashPath(m.LocalPrefix)
+		if local == "" {
+			continue
+		}
+		if norm == local || (runtime.GOOS == "windows" && strings.EqualFold(norm, local)) {
+			return remote
+		}
+		if strings.HasPrefix(norm, local+"/") {
+			suffix := norm[len(local):]
+			return NormalizeSlashPath(remote + suffix)
+		}
+		if runtime.GOOS == "windows" && len(norm) > len(local) &&
+			strings.EqualFold(norm[:len(local)+1], local+"/") {
+			suffix := norm[len(local):]
+			return NormalizeSlashPath(remote + suffix)
 		}
 	}
 	return norm
@@ -630,11 +656,12 @@ func buildEntriesForTorrent(inst config.QbitInstanceConfig, t torrentInfoJSON, f
 			TrackerHost:   trackerHost,
 			TrackerHealth: trackerHealth,
 			TrackerMsg:    trackerMsg,
-			SavePath:      savePath,
-			RelativeName:  relName,
-			MappedPath:    mapped,
-			Filename:      filename,
-			Size:          f.Size,
+			SavePath:         savePath,
+			RelativeName:     relName,
+			MappedPath:       mapped,
+			Filename:         filename,
+			Size:             f.Size,
+			TorrentFileCount: len(files),
 		})
 	}
 	return out
@@ -789,20 +816,49 @@ func (c *Client) BuildIndexForHashes(ctx context.Context, instances []config.Qbi
 	return idx
 }
 
-func (c *Client) DeleteTorrents(ctx context.Context, inst config.QbitInstanceConfig, hashes []string, deleteFiles bool) ([]string, error) {
-	seen := make(map[string]struct{}, len(hashes))
-	unique := make([]string, 0, len(hashes))
-	for _, h := range hashes {
-		trimmed := strings.TrimSpace(h)
-		if trimmed == "" {
-			continue
-		}
-		if _, ok := seen[trimmed]; ok {
-			continue
-		}
-		seen[trimmed] = struct{}{}
-		unique = append(unique, trimmed)
+func doPostForm(ctx context.Context, hc *http.Client, fullURL string, form url.Values) (int, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return 0, "", err
 	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := hc.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	return resp.StatusCode, strings.TrimSpace(string(b)), nil
+}
+
+func postFormChecked(ctx context.Context, hc *http.Client, fullURL string, form url.Values, opName string) error {
+	status, body, err := doPostForm(ctx, hc, fullURL, form)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("%s failed with HTTP %d: %s", opName, status, body)
+	}
+	return nil
+}
+
+func postFormWithFallback(ctx context.Context, hc *http.Client, primaryURL, fallbackURL string, form url.Values, opName string) error {
+	status, body, err := doPostForm(ctx, hc, primaryURL, form)
+	if err != nil {
+		return err
+	}
+	if status == http.StatusNotFound && fallbackURL != "" {
+		return postFormChecked(ctx, hc, fallbackURL, form, opName)
+	}
+	if status >= 400 {
+		return fmt.Errorf("%s failed with HTTP %d: %s", opName, status, body)
+	}
+	return nil
+}
+
+func (c *Client) DeleteTorrents(ctx context.Context, inst config.QbitInstanceConfig, hashes []string, deleteFiles bool) ([]string, error) {
+	unique, _ := uniqueNonEmptyHashes(hashes)
 	if len(unique) == 0 {
 		return []string{}, nil
 	}
@@ -820,20 +876,142 @@ func (c *Client) DeleteTorrents(ctx context.Context, inst config.QbitInstanceCon
 		form.Set("deleteFiles", "false")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/v2/torrents/delete", strings.NewReader(form.Encode()))
-	if err != nil {
+	if err := postFormChecked(ctx, hc, baseURL+"/api/v2/torrents/delete", form, "qBittorrent delete"); err != nil {
 		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := hc.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return nil, fmt.Errorf("qBittorrent delete failed with HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	return unique, nil
+}
+
+type RelocateTorrentOutcome struct {
+	InstanceID   string `json:"instance_id"`
+	InstanceName string `json:"instance_name"`
+	TorrentHash  string `json:"torrent_hash"`
+	TorrentName  string `json:"torrent_name"`
+	FileCount    int    `json:"file_count"`
+	OldSavePath  string `json:"old_save_path"`
+	OldRelPath   string `json:"old_rel_path"`
+	NewSavePath  string `json:"new_save_path"`
+	NewRelPath   string `json:"new_rel_path"`
+	Renamed      bool   `json:"renamed"`
+}
+
+// RelocateSingleFileTorrent moves and (if needed) renames a single-file torrent in qBittorrent
+// so it can continue seeding from the new path created by Radarr/Sonarr Move imports.
+func (c *Client) RelocateSingleFileTorrent(ctx context.Context, inst config.QbitInstanceConfig, hash, newRemotePath string, dryRun bool) (RelocateTorrentOutcome, error) {
+	trimmedHash := strings.TrimSpace(hash)
+	if trimmedHash == "" {
+		return RelocateTorrentOutcome{}, errors.New("missing torrent hash")
+	}
+	newRemote := NormalizeSlashPath(newRemotePath)
+	if newRemote == "" {
+		return RelocateTorrentOutcome{}, errors.New("missing target remote path")
+	}
+
+	hc, baseURL, err := c.newAuthedHTTPClient(ctx, inst)
+	if err != nil {
+		return RelocateTorrentOutcome{}, err
+	}
+
+	var infos []torrentInfoJSON
+	infoURL := baseURL + "/api/v2/torrents/info?hashes=" + url.QueryEscape(trimmedHash)
+	if err := doGetJSON(ctx, hc, infoURL, &infos); err != nil {
+		return RelocateTorrentOutcome{}, err
+	}
+	var targetInfo *torrentInfoJSON
+	for i := range infos {
+		if strings.EqualFold(strings.TrimSpace(infos[i].Hash), trimmedHash) {
+			targetInfo = &infos[i]
+			break
+		}
+	}
+	if targetInfo == nil {
+		return RelocateTorrentOutcome{}, fmt.Errorf("torrent %s not found in qBittorrent", trimmedHash)
+	}
+
+	var files []torrentFileJSON
+	filesURL := baseURL + "/api/v2/torrents/files?hash=" + url.QueryEscape(targetInfo.Hash)
+	if err := doGetJSON(ctx, hc, filesURL, &files); err != nil {
+		return RelocateTorrentOutcome{}, err
+	}
+	if len(files) != 1 {
+		return RelocateTorrentOutcome{}, fmt.Errorf("skipping multi-file torrent (%d files); only single-file torrents can be auto-relocated", len(files))
+	}
+
+	oldRelPath := strings.TrimLeft(NormalizeSlashPath(files[0].Name), "/")
+	if oldRelPath == "" {
+		return RelocateTorrentOutcome{}, errors.New("empty relative file path in torrent")
+	}
+
+	var newSavePath, newRelPath string
+	if !strings.Contains(oldRelPath, "/") {
+		newSavePath = path.Dir(newRemote)
+		newRelPath = path.Base(newRemote)
+	} else {
+		parentDir := path.Dir(newRemote)
+		grandParent := path.Dir(parentDir)
+		if grandParent != "" && grandParent != "." && grandParent != parentDir {
+			newSavePath = grandParent
+			newRelPath = path.Base(parentDir) + "/" + path.Base(newRemote)
+		} else {
+			newSavePath = parentDir
+			newRelPath = path.Base(newRemote)
+		}
+	}
+
+	outcome := RelocateTorrentOutcome{
+		InstanceID:   inst.ID,
+		InstanceName: inst.Name,
+		TorrentHash:  targetInfo.Hash,
+		TorrentName:  targetInfo.Name,
+		FileCount:    len(files),
+		OldSavePath:  NormalizeSlashPath(targetInfo.SavePath),
+		OldRelPath:   oldRelPath,
+		NewSavePath:  NormalizeSlashPath(newSavePath),
+		NewRelPath:   newRelPath,
+		Renamed:      oldRelPath != newRelPath,
+	}
+	if dryRun {
+		return outcome, nil
+	}
+
+	hashForm := url.Values{}
+	hashForm.Set("hashes", targetInfo.Hash)
+
+	if err := postFormWithFallback(ctx, hc, baseURL+"/api/v2/torrents/stop", baseURL+"/api/v2/torrents/pause", hashForm, "qBittorrent stop"); err != nil {
+		return RelocateTorrentOutcome{}, err
+	}
+
+	tmmForm := url.Values{}
+	tmmForm.Set("hashes", targetInfo.Hash)
+	tmmForm.Set("enable", "false")
+	if err := postFormChecked(ctx, hc, baseURL+"/api/v2/torrents/setAutoManagement", tmmForm, "qBittorrent setAutoManagement"); err != nil {
+		return RelocateTorrentOutcome{}, err
+	}
+
+	locForm := url.Values{}
+	locForm.Set("hashes", targetInfo.Hash)
+	locForm.Set("location", outcome.NewSavePath)
+	if err := postFormChecked(ctx, hc, baseURL+"/api/v2/torrents/setLocation", locForm, "qBittorrent setLocation"); err != nil {
+		return RelocateTorrentOutcome{}, err
+	}
+
+	if outcome.Renamed {
+		renForm := url.Values{}
+		renForm.Set("hash", targetInfo.Hash)
+		renForm.Set("oldPath", oldRelPath)
+		renForm.Set("newPath", newRelPath)
+		if err := postFormChecked(ctx, hc, baseURL+"/api/v2/torrents/renameFile", renForm, "qBittorrent renameFile"); err != nil {
+			return RelocateTorrentOutcome{}, err
+		}
+	}
+
+	if err := postFormChecked(ctx, hc, baseURL+"/api/v2/torrents/recheck", hashForm, "qBittorrent recheck"); err != nil {
+		return RelocateTorrentOutcome{}, err
+	}
+
+	if err := postFormWithFallback(ctx, hc, baseURL+"/api/v2/torrents/start", baseURL+"/api/v2/torrents/resume", hashForm, "qBittorrent start"); err != nil {
+		return RelocateTorrentOutcome{}, err
+	}
+
+	return outcome, nil
 }

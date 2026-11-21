@@ -67,6 +67,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/actions/delete-files", s.handleDeleteFiles)
 	s.mux.HandleFunc("POST /api/actions/arr-import", s.handleArrImport)
 	s.mux.HandleFunc("POST /api/actions/arr-rescan", s.handleArrRescan)
+	s.mux.HandleFunc("POST /api/actions/qbit-relocate", s.handleQbitRelocate)
 	s.mux.HandleFunc("POST /api/arr/commands/status", s.handleArrCommandsStatus)
 	s.mux.HandleFunc("GET /api/export", s.handleExport)
 
@@ -325,9 +326,10 @@ func waitForDeletedPaths(r *http.Request, paths []string) {
 func (s *Server) handleRefreshGroups(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	var payload struct {
-		GroupIDs            []string `json:"group_ids"`
-		WaitForDeletedPaths []string `json:"wait_for_deleted_paths"`
-		IncludeArr          *bool    `json:"include_arr"`
+		GroupIDs            []string            `json:"group_ids"`
+		WaitForDeletedPaths []string            `json:"wait_for_deleted_paths"`
+		IncludeArr          *bool               `json:"include_arr"`
+		ExtraQbitHashes     map[string][]string `json:"extra_qbit_hashes"`
 	}
 	if err := decodeJSONBody(w, r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON payload: %v", err))
@@ -398,6 +400,16 @@ func (s *Server) handleRefreshGroups(w http.ResponseWriter, r *http.Request) {
 				if am.ItemID > 0 {
 					itemIDsByInstance[am.InstanceID] = append(itemIDsByInstance[am.InstanceID], am.ItemID)
 				}
+			}
+		}
+	}
+	for instID, extraHashes := range payload.ExtraQbitHashes {
+		if strings.TrimSpace(instID) == "" {
+			continue
+		}
+		for _, h := range extraHashes {
+			if strings.TrimSpace(h) != "" {
+				hashesByInstance[instID] = append(hashesByInstance[instID], h)
 			}
 		}
 	}
@@ -709,6 +721,28 @@ func (s *Server) handleArrRescan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := actions.TriggerArrRescanAction(r.Context(), s.cfgMgr.Get(), s.arrClient, payload.Items, payload.DryRun)
+	if err != nil {
+		if errors.Is(err, actions.ErrReadOnlyMode) {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleQbitRelocate(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		Items  []actions.QbitRelocateItem `json:"items"`
+		DryRun bool                       `json:"dry_run"`
+	}
+	if err := decodeJSONBody(w, r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON payload: %v", err))
+		return
+	}
+
+	res, err := actions.RelocateQbitTorrentsAction(r.Context(), s.cfgMgr.Get(), s.qbitClient, payload.Items, payload.DryRun)
 	if err != nil {
 		if errors.Is(err, actions.ErrReadOnlyMode) {
 			writeError(w, http.StatusForbidden, err.Error())

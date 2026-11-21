@@ -45,18 +45,22 @@ type mockTorrent struct {
 }
 
 type mockQbitServer struct {
-	mu                     sync.Mutex
-	torrents               map[string]mockTorrent
-	server                 *httptest.Server
-	localMap               map[string]string // remote prefix -> local root for optional deleteFiles simulation
-	omitInlineTrackers     bool
+	mu                 sync.Mutex
+	torrents           map[string]mockTorrent
+	server             *httptest.Server
+	localMap           map[string]string // remote prefix -> local root for optional deleteFiles simulation
+	omitInlineTrackers bool
+	relocateOps        []string
+	autoManagement     map[string]bool
+	rechecked          []string
 }
 
 func newMockQbitServer(t *testing.T, initial []mockTorrent) *mockQbitServer {
 	t.Helper()
 	mq := &mockQbitServer{
-		torrents: make(map[string]mockTorrent),
-		localMap: make(map[string]string),
+		torrents:       make(map[string]mockTorrent),
+		localMap:       make(map[string]string),
+		autoManagement: make(map[string]bool),
 	}
 	for _, mt := range initial {
 		mq.torrents[mt.Hash] = mt
@@ -192,6 +196,104 @@ func newMockQbitServer(t *testing.T, initial []mockTorrent) *mockQbitServer {
 			}
 			delete(mq.torrents, h)
 		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	handleLifecycle := func(op string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if !requireAuth(w, r) {
+				return
+			}
+			_ = r.ParseForm()
+			mq.mu.Lock()
+			for _, h := range strings.Split(r.FormValue("hashes"), "|") {
+				if strings.TrimSpace(h) != "" {
+					mq.relocateOps = append(mq.relocateOps, op+":"+h)
+				}
+			}
+			mq.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		}
+	}
+
+	mux.HandleFunc("/api/v2/torrents/stop", handleLifecycle("stop"))
+	mux.HandleFunc("/api/v2/torrents/pause", handleLifecycle("pause"))
+	mux.HandleFunc("/api/v2/torrents/start", handleLifecycle("start"))
+	mux.HandleFunc("/api/v2/torrents/resume", handleLifecycle("resume"))
+
+	mux.HandleFunc("/api/v2/torrents/setAutoManagement", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAuth(w, r) {
+			return
+		}
+		_ = r.ParseForm()
+		enable := r.FormValue("enable") == "true"
+		mq.mu.Lock()
+		for _, h := range strings.Split(r.FormValue("hashes"), "|") {
+			if strings.TrimSpace(h) != "" {
+				mq.autoManagement[h] = enable
+				mq.relocateOps = append(mq.relocateOps, "autoMgmt:"+h+":"+r.FormValue("enable"))
+			}
+		}
+		mq.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux.HandleFunc("/api/v2/torrents/setLocation", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAuth(w, r) {
+			return
+		}
+		_ = r.ParseForm()
+		loc := r.FormValue("location")
+		mq.mu.Lock()
+		for _, h := range strings.Split(r.FormValue("hashes"), "|") {
+			if mt, ok := mq.torrents[h]; ok {
+				mt.SavePath = loc
+				mq.torrents[h] = mt
+				mq.relocateOps = append(mq.relocateOps, "setLocation:"+h+":"+loc)
+			}
+		}
+		mq.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux.HandleFunc("/api/v2/torrents/renameFile", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAuth(w, r) {
+			return
+		}
+		_ = r.ParseForm()
+		h := r.FormValue("hash")
+		oldP := r.FormValue("oldPath")
+		newP := r.FormValue("newPath")
+		mq.mu.Lock()
+		defer mq.mu.Unlock()
+		mt, ok := mq.torrents[h]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		for i := range mt.Files {
+			if mt.Files[i].Name == oldP {
+				mt.Files[i].Name = newP
+			}
+		}
+		mq.torrents[h] = mt
+		mq.relocateOps = append(mq.relocateOps, "renameFile:"+h+":"+oldP+"->"+newP)
+		w.WriteHeader(http.StatusOK)
+	})
+
+	mux.HandleFunc("/api/v2/torrents/recheck", func(w http.ResponseWriter, r *http.Request) {
+		if !requireAuth(w, r) {
+			return
+		}
+		_ = r.ParseForm()
+		mq.mu.Lock()
+		for _, h := range strings.Split(r.FormValue("hashes"), "|") {
+			if strings.TrimSpace(h) != "" {
+				mq.rechecked = append(mq.rechecked, h)
+				mq.relocateOps = append(mq.relocateOps, "recheck:"+h)
+			}
+		}
+		mq.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -1719,5 +1821,283 @@ func TestRefreshGroupsAndArrCommandStatus(t *testing.T) {
 		"commands": []map[string]any{{"instance_id": "rad1", "command_id": cmdID}},
 	}, &st2); c != http.StatusOK || !st2.AllDone || len(st2.Commands) != 1 || st2.Commands[0].Status != "completed" {
 		t.Fatalf("expected completed/done command status, got code=%d %+v", c, st2)
+	}
+}
+
+func TestQbitRelocateAfterArrMove(t *testing.T) {
+	root := t.TempDir()
+	plexDir := filepath.Join(root, "plex_series")
+	dlDir := filepath.Join(root, "downloads")
+	if err := os.MkdirAll(plexDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dlDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	epSize := 44 * 1024
+	oldTaskmasterPlex := filepath.Join(plexDir, "taskmaster SE", "Season 13", "Taskmaster.SE.S13E01.mkv")
+	writeTestFile(t, oldTaskmasterPlex, makePayload("taskmaster-s13e01", epSize))
+
+	wrappedDir := filepath.Join(dlDir, "Taskmaster.S13E01")
+	wrappedDlFile := filepath.Join(wrappedDir, "Taskmaster.SE.S13E01.mkv")
+	if err := os.MkdirAll(wrappedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(oldTaskmasterPlex, wrappedDlFile); err != nil {
+		t.Fatal(err)
+	}
+
+	packDl := filepath.Join(dlDir, "Season13Pack", "Episode02.mkv")
+	writeTestFile(t, packDl, makePayload("pack-ep02", 24*1024))
+
+	flatHash := "1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa"
+	wrappedHash := "2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb"
+	multiHash := "3333cccc3333cccc3333cccc3333cccc3333cccc"
+
+	mq := newMockQbitServer(t, []mockTorrent{
+		{
+			Hash:     flatHash,
+			Name:     "Taskmaster.SE.S13E01.mkv",
+			SavePath: "/qbit_plex/taskmaster SE/Season 13",
+			State:    "uploading",
+			Ratio:    1.8,
+			Tracker:  "https://tracker.test/announce",
+			Trackers: []mockTracker{{URL: "https://tracker.test/announce", Status: 2}},
+			Files: []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+			}{{Name: "Taskmaster.SE.S13E01.mkv", Size: int64(epSize)}},
+		},
+		{
+			Hash:     wrappedHash,
+			Name:     "Taskmaster.S13E01",
+			SavePath: "/qbit_dl",
+			State:    "stalledUP",
+			Ratio:    1.1,
+			Tracker:  "https://tracker.test/announce",
+			Trackers: []mockTracker{{URL: "https://tracker.test/announce", Status: 2}},
+			Files: []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+			}{{Name: "Taskmaster.S13E01/Taskmaster.SE.S13E01.mkv", Size: int64(epSize)}},
+		},
+		{
+			Hash:     multiHash,
+			Name:     "Season13Pack",
+			SavePath: "/qbit_dl",
+			State:    "uploading",
+			Ratio:    0.9,
+			Tracker:  "https://tracker.test/announce",
+			Trackers: []mockTracker{{URL: "https://tracker.test/announce", Status: 2}},
+			Files: []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+			}{
+				{Name: "Season13Pack/Episode02.mkv", Size: int64(24 * 1024)},
+				{Name: "Season13Pack/Season13.nfo", Size: 512},
+			},
+		},
+	})
+
+	sonarrMock := newMockArrServer(t, "sonarr")
+	sonarrMock.series = []map[string]any{
+		{
+			"id":        88,
+			"title":     "Taskmaster SE",
+			"year":      2017,
+			"path":      "/tv/Bäst i Test",
+			"monitored": true,
+		},
+	}
+	sonarrMock.wanted = []map[string]any{
+		{
+			"id":            8800,
+			"seriesId":      88,
+			"seasonNumber":  13,
+			"episodeNumber": 1,
+			"title":         "Premiere",
+			"monitored":     true,
+			"hasFile":       false,
+		},
+	}
+
+	cfgMgr, err := config.NewManager(filepath.Join(root, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cfgMgr.Update(config.AppSettings{
+		ReadOnlyMode: true,
+		Folders: []config.FolderConfig{
+			{ID: "plex", Label: "Plex Series", Path: plexDir, Role: "primary"},
+			{ID: "dl", Label: "Downloads", Path: dlDir, Role: "secondary"},
+		},
+		QbitInstances: []config.QbitInstanceConfig{
+			{
+				ID:       "q1",
+				Name:     "Series Qbit",
+				URL:      mq.server.URL,
+				Username: "admin",
+				Password: "secret",
+				Enabled:  true,
+				PathMappings: []config.PathMapping{
+					{RemotePrefix: "/qbit_plex", LocalPrefix: qbit.NormalizeSlashPath(plexDir)},
+					{RemotePrefix: "/qbit_dl", LocalPrefix: qbit.NormalizeSlashPath(dlDir)},
+				},
+			},
+		},
+		ArrInstances: []config.ArrInstanceConfig{
+			{
+				ID:      "son1",
+				Name:    "Sonarr",
+				Type:    "sonarr",
+				URL:     sonarrMock.server.URL,
+				APIKey:  "arr-secret-key",
+				Enabled: true,
+				PathMappings: []config.PathMapping{
+					{RemotePrefix: "/tv", LocalPrefix: qbit.NormalizeSlashPath(plexDir)},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(server.New(cfgMgr, qbit.NewClient(5*time.Second), arr.NewClient(5*time.Second), nil))
+	t.Cleanup(ts.Close)
+
+	// 1. Scan reports torrent_file_count == 1 vs 2
+	var scanRes scanner.ScanResult
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/scan", nil, &scanRes); c != http.StatusOK {
+		t.Fatalf("expected 200 on initial scan, got %d", c)
+	}
+	var taskGrp, packGrp scanner.ComparisonGroup
+	for _, g := range scanRes.Groups {
+		if g.Filename == "Taskmaster.SE.S13E01.mkv" {
+			taskGrp = g
+		}
+		if g.Filename == "Episode02.mkv" {
+			packGrp = g
+		}
+	}
+	if taskGrp.ID == "" || len(taskGrp.Torrents) != 2 {
+		t.Fatalf("expected Taskmaster group with 2 matched torrents, got %+v", taskGrp)
+	}
+	for _, tm := range taskGrp.Torrents {
+		if tm.TorrentFileCount != 1 {
+			t.Fatalf("expected TorrentFileCount=1 on single-file torrent %s, got %+v", tm.TorrentHash, tm)
+		}
+	}
+	if packGrp.ID == "" || len(packGrp.Torrents) != 1 || packGrp.Torrents[0].TorrentFileCount != 2 {
+		t.Fatalf("expected Episode02 pack group with TorrentFileCount=2, got %+v", packGrp)
+	}
+
+	// Simulate Sonarr moving + renaming the file into Bäst i Test/Season 13/
+	movedPlex := filepath.Join(plexDir, "Bäst i Test", "Season 13", "Bäst i Test - S13E01.mkv")
+	if err := os.MkdirAll(filepath.Dir(movedPlex), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(oldTaskmasterPlex, movedPlex); err != nil {
+		t.Fatal(err)
+	}
+	sonarrMock.mu.Lock()
+	sonarrMock.wanted = nil
+	sonarrMock.episodeFiles["88"] = []map[string]any{
+		{
+			"id":           8801,
+			"seriesId":     88,
+			"seasonNumber": 13,
+			"path":         "/tv/Bäst i Test/Season 13/Bäst i Test - S13E01.mkv",
+			"relativePath": "Season 13/Bäst i Test - S13E01.mkv",
+			"size":         epSize,
+		},
+	}
+	sonarrMock.mu.Unlock()
+
+	movedNorm := qbit.NormalizeSlashPath(movedPlex)
+
+	// 2. Read-only mode blocks execute (403) while dry_run=true returns 200 with planned save/rel path
+	relPayload := map[string]any{
+		"items": []map[string]any{
+			{"instance_id": "q1", "torrent_hash": flatHash, "new_local_path": movedNorm},
+			{"instance_id": "q1", "torrent_hash": wrappedHash, "new_local_path": movedNorm},
+			{"instance_id": "q1", "torrent_hash": multiHash, "new_local_path": qbit.NormalizeSlashPath(packDl)},
+		},
+		"dry_run": true,
+	}
+	var dryRel actions.QbitRelocateResult
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/actions/qbit-relocate", relPayload, &dryRel); c != http.StatusOK {
+		t.Fatalf("expected 200 on dry_run qbit-relocate, got %d", c)
+	}
+	if dryRel.RelocatedCount != 2 || len(dryRel.Errors) != 1 {
+		t.Fatalf("expected 2 eligible single-file outcomes and 1 multi-file skip error, got %+v", dryRel)
+	}
+	if dryRel.Results[0].NewSavePath != "/qbit_plex/Bäst i Test/Season 13" ||
+		dryRel.Results[0].NewRelPath != "Bäst i Test - S13E01.mkv" || !dryRel.Results[0].Renamed {
+		t.Fatalf("unexpected flat torrent relocate outcome: %+v", dryRel.Results[0])
+	}
+	if dryRel.Results[1].NewSavePath != "/qbit_plex/Bäst i Test" ||
+		dryRel.Results[1].NewRelPath != "Season 13/Bäst i Test - S13E01.mkv" || !dryRel.Results[1].Renamed {
+		t.Fatalf("unexpected wrapped torrent relocate outcome: %+v", dryRel.Results[1])
+	}
+
+	relPayload["dry_run"] = false
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/actions/qbit-relocate", relPayload, nil); c != http.StatusForbidden {
+		t.Fatalf("expected 403 for qbit-relocate in read-only mode, got %d", c)
+	}
+
+	// 3. Unlock write mode & execute qbit-relocate
+	apiDoJSON(t, ts, http.MethodPatch, "/api/config/read-only", map[string]bool{"read_only_mode": false}, nil)
+	var execRel actions.QbitRelocateResult
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/actions/qbit-relocate", relPayload, &execRel); c != http.StatusOK {
+		t.Fatalf("expected 200 on qbit-relocate execute, got %d", c)
+	}
+	if execRel.RelocatedCount != 2 || len(execRel.Errors) != 1 {
+		t.Fatalf("expected 2 relocated torrents and 1 skipped multi-file error, got %+v", execRel)
+	}
+
+	mq.mu.Lock()
+	flatMT := mq.torrents[flatHash]
+	wrappedMT := mq.torrents[wrappedHash]
+	multiMT := mq.torrents[multiHash]
+	autoMgmtFlat, hasMgmt := mq.autoManagement[flatHash]
+	ops := append([]string(nil), mq.relocateOps...)
+	rechecked := append([]string(nil), mq.rechecked...)
+	mq.mu.Unlock()
+
+	if !hasMgmt || autoMgmtFlat {
+		t.Fatalf("expected setAutoManagement(false) on flat torrent, got hasMgmt=%v val=%v", hasMgmt, autoMgmtFlat)
+	}
+	if flatMT.SavePath != "/qbit_plex/Bäst i Test/Season 13" || flatMT.Files[0].Name != "Bäst i Test - S13E01.mkv" {
+		t.Fatalf("expected flat torrent SavePath/File renamed, got %+v", flatMT)
+	}
+	if wrappedMT.SavePath != "/qbit_plex/Bäst i Test" || wrappedMT.Files[0].Name != "Season 13/Bäst i Test - S13E01.mkv" {
+		t.Fatalf("expected wrapped torrent SavePath/File renamed, got %+v", wrappedMT)
+	}
+	if multiMT.SavePath != "/qbit_dl" || multiMT.Files[0].Name != "Season13Pack/Episode02.mkv" {
+		t.Fatalf("expected multi-file torrent untouched, got %+v", multiMT)
+	}
+	if len(rechecked) != 2 {
+		t.Fatalf("expected 2 recheck calls, got %+v", rechecked)
+	}
+	joinedOps := strings.Join(ops, ",")
+	if !strings.Contains(joinedOps, "stop:"+flatHash) || !strings.Contains(joinedOps, "start:"+flatHash) {
+		t.Fatalf("expected stop/start lifecycle around relocate, got ops=%v", ops)
+	}
+
+	// 4. Refresh group with extra_qbit_hashes discovers moved file in Arr and re-attaches relocated torrents
+	var refRes struct {
+		UpdatedGroups []scanner.ComparisonGroup `json:"updated_groups"`
+	}
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/scan/refresh-groups", map[string]any{
+		"group_ids":         []string{taskGrp.ID},
+		"include_arr":       true,
+		"extra_qbit_hashes": map[string][]string{"q1": {flatHash, wrappedHash}},
+	}, &refRes); c != http.StatusOK || len(refRes.UpdatedGroups) != 1 {
+		t.Fatalf("expected 1 updated group on refresh-groups, got code=%d %+v", c, refRes)
+	}
+	if refRes.UpdatedGroups[0].ArrSummary != "IMPORTED" || refRes.UpdatedGroups[0].SeedingSummary != "SEEDING" || len(refRes.UpdatedGroups[0].Torrents) != 2 {
+		t.Fatalf("expected moved group to become IMPORTED + SEEDING with 2 torrents, got %+v", refRes.UpdatedGroups[0])
 	}
 }

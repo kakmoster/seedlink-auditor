@@ -65,11 +65,12 @@ type TorrentMatch struct {
 	TrackerMsg    string   `json:"tracker_msg"`
 	SavePath      string   `json:"save_path"`
 	RelativeName  string   `json:"relative_name"`
-	MappedPath    string   `json:"mapped_path"`
-	Size          int64    `json:"size"`
-	MatchType     string   `json:"match_type"`
-	MatchedPaths  []string `json:"matched_paths"`
-	MatchedRoles  []string `json:"matched_roles"`
+	MappedPath       string   `json:"mapped_path"`
+	Size             int64    `json:"size"`
+	TorrentFileCount int      `json:"torrent_file_count"`
+	MatchType        string   `json:"match_type"`
+	MatchedPaths     []string `json:"matched_paths"`
+	MatchedRoles     []string `json:"matched_roles"`
 }
 
 type ArrReference struct {
@@ -768,11 +769,12 @@ func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEn
 					TrackerMsg:    m.Entry.TrackerMsg,
 					SavePath:      m.Entry.SavePath,
 					RelativeName:  m.Entry.RelativeName,
-					MappedPath:    m.Entry.MappedPath,
-					Size:          m.Entry.Size,
-					MatchType:     m.MatchType,
-					MatchedPaths:  []string{f.AbsPath},
-					MatchedRoles:  []string{f.FolderRole},
+					MappedPath:       m.Entry.MappedPath,
+					Size:             m.Entry.Size,
+					TorrentFileCount: m.Entry.TorrentFileCount,
+					MatchType:        m.MatchType,
+					MatchedPaths:     []string{f.AbsPath},
+					MatchedRoles:     []string{f.FolderRole},
 				}
 				matchedMap[tk] = &tm
 				matchedOrder = append(matchedOrder, tk)
@@ -1408,6 +1410,13 @@ func RefreshSingleGroup(settings config.AppSettings, prev ComparisonGroup, qbitI
 	groupFiles := make([]ScannedFile, 0, len(prevFiles)+len(discoveredArrPaths))
 	seenPaths := make(map[string]struct{}, len(prevFiles)+len(discoveredArrPaths))
 	existingInodes := make(map[devInodeKey]struct{}, len(prevFiles))
+
+	// Seed inodes from previous scan before Lstat so files moved/renamed by Arr still match by inode.
+	for _, pf := range prevFiles {
+		if pf.Inode != 0 {
+			existingInodes[devInodeKey{Device: pf.Device, Inode: pf.Inode}] = struct{}{}
+		}
+	}
 
 	for _, pf := range prevFiles {
 		pk := pathCompareKey(pf.AbsPath)
