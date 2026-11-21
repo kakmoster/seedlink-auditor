@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,7 @@ type ScannedFile struct {
 	Size        int64   `json:"size"`
 	Mtime       float64 `json:"mtime"`
 	Inode       uint64  `json:"inode"`
+	InodeStr    string  `json:"inode_str,omitempty"`
 	Device      uint64  `json:"device"`
 	Nlink       int     `json:"nlink"`
 }
@@ -244,6 +246,7 @@ func scanDirectory(folder config.FolderConfig, ignoreExts map[string]struct{}, m
 			Size:        info.Size(),
 			Mtime:       float64(info.ModTime().UnixNano()) / 1e9,
 			Inode:       fstat.Inode,
+			InodeStr:    strconv.FormatUint(fstat.Inode, 10),
 			Device:      fstat.Device,
 			Nlink:       fstat.Nlink,
 		})
@@ -1372,6 +1375,7 @@ func statScannedFileFromDisk(folder config.FolderConfig, absPath string, ignoreE
 		Size:        info.Size(),
 		Mtime:       float64(info.ModTime().UnixNano()) / 1e9,
 		Inode:       fstat.Inode,
+		InodeStr:    strconv.FormatUint(fstat.Inode, 10),
 		Device:      fstat.Device,
 		Nlink:       fstat.Nlink,
 	}, true
@@ -1452,6 +1456,8 @@ func RefreshSingleGroup(settings config.AppSettings, prev ComparisonGroup, qbitI
 		}
 	}
 
+	candidates := make([]ScannedFile, 0, len(discoveredArrPaths))
+	matchedStrict := false
 	for _, dp := range discoveredArrPaths {
 		pk := pathCompareKey(dp)
 		if pk == "" {
@@ -1470,17 +1476,32 @@ func RefreshSingleGroup(settings config.AppSettings, prev ComparisonGroup, qbitI
 		if !alive {
 			continue
 		}
+		candidates = append(candidates, sf)
 
 		_, sameInode := existingInodes[devInodeKey{Device: sf.Device, Inode: sf.Inode}]
-		belongs := (sf.Inode != 0 && sameInode) ||
-			strings.EqualFold(sf.Filename, prev.Filename) ||
-			(prev.Size > 0 && sf.Size == prev.Size && strings.EqualFold(sf.Ext, prev.Ext))
-		if !belongs {
-			continue
+		if (sf.Inode != 0 && sameInode) || strings.EqualFold(sf.Filename, prev.Filename) {
+			matchedStrict = true
+			groupFiles = append(groupFiles, sf)
+			if sf.Inode != 0 {
+				existingInodes[devInodeKey{Device: sf.Device, Inode: sf.Inode}] = struct{}{}
+			}
 		}
-		groupFiles = append(groupFiles, sf)
-		if sf.Inode != 0 {
-			existingInodes[devInodeKey{Device: sf.Device, Inode: sf.Inode}] = struct{}{}
+	}
+
+	// Fallback for cross-device Move where inode changed and Arr renamed the file.
+	if !matchedStrict && len(groupFiles) == 0 && prev.Size > 0 {
+		var fallbackMatches []ScannedFile
+		for _, sf := range candidates {
+			if sf.Size == prev.Size && strings.EqualFold(sf.Ext, prev.Ext) {
+				fallbackMatches = append(fallbackMatches, sf)
+			}
+		}
+		if len(fallbackMatches) == 1 {
+			sf := fallbackMatches[0]
+			groupFiles = append(groupFiles, sf)
+			if sf.Inode != 0 {
+				existingInodes[devInodeKey{Device: sf.Device, Inode: sf.Inode}] = struct{}{}
+			}
 		}
 	}
 

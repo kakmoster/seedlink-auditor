@@ -179,6 +179,10 @@
           </div>
 
           <div class="controls-right">
+            <div class="view-toggle" role="group" aria-label="View mode">
+              <button id="viewModeGroupedBtn" class="view-toggle-btn active" data-view-mode="grouped" type="button" title="Collapse multi-file torrents (season packs) into expandable parent rows">Packs</button>
+              <button id="viewModeFlatBtn" class="view-toggle-btn" data-view-mode="flat" type="button" title="Show every file as its own row">Files</button>
+            </div>
             <button id="expandPageBtn" class="btn btn-secondary btn-sm" type="button" title="Expand or collapse all details on the current page">
               Expand Page
             </button>
@@ -402,12 +406,31 @@
               <option value="move">Move (relocates file into Arr library &amp; removes original path)</option>
             </select>
           </div>
+          <div id="packSiblingsOptionRow" class="pack-siblings-box" hidden>
+            <label>
+              <input type="checkbox" id="includePackSiblingsCheckbox" checked />
+              <span id="packSiblingsLabel">Also Move sibling episodes from the same multi-file torrent pack so qBittorrent can relocate cleanly</span>
+            </label>
+            <div id="packSiblingsHint" class="relocate-option-hint"></div>
+          </div>
           <div id="qbitRelocateOptionRow" class="relocate-option-box" hidden>
             <label>
               <input type="checkbox" id="relocateQbitAfterMoveCheckbox" checked />
-              <span>Also update qBittorrent save path &amp; filename after Move so single-file torrents keep seeding</span>
+              <span>Also update qBittorrent save path &amp; filenames after Move so torrents keep seeding (single-file &amp; multi-file packs)</span>
             </label>
             <div id="qbitRelocateSummary" class="relocate-option-hint"></div>
+            <div id="qbitCompanionOptionRow" class="relocate-sub-option" hidden>
+              <label>
+                <input type="checkbox" id="moveCompanionFilesCheckbox" checked />
+                <span id="moveCompanionFilesLabel">Also move companion files (.nfo, .srt subtitles, artwork) with the pack so qBittorrent stays 100%</span>
+              </label>
+            </div>
+            <div id="qbitSampleOptionRow" class="relocate-sub-option relocate-sub-warn" hidden>
+              <label>
+                <input type="checkbox" id="moveSampleFilesCheckbox" />
+                <span id="moveSampleFilesLabel">Also move Sample / Extra files into library (warning: may show up in Plex/library; off by default)</span>
+              </label>
+            </div>
           </div>
           <label style="margin-top: 8px;">
             <input type="checkbox" id="forceManualImportCheckbox" />

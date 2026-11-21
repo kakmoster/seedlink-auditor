@@ -18,13 +18,18 @@
     arrFilter: "ALL",
     folderFilter: "ALL",
     sortBy: "default",
+    viewMode: "grouped",
     page: 1,
     pageSize: 100,
     selectedGroupIds: new Set(),
+    expandedPackIds: new Set(),
     expandedGroupIds: new Set(),
+    currentPackMap: new Map(),
     pendingArrRefreshGroups: new Set(),
     activeSettingsTab: "folders",
     scanEpoch: 0,
+    actionPreviewEpoch: 0,
+    lastInspectResult: null,
     pickerTargetIndex: null,
     pickerCurrentPath: "",
     pickerParentPath: null,
@@ -236,8 +241,19 @@
     $("tabCountOnlyA").textContent = String(s.only_in_a_count);
   }
 
-  function sortGroups(list, sortBy) {
-    if (!sortBy || sortBy === "default") return list;
+  const STATUS_PRIORITY = {
+    ORPHANED_IN_B: 0,
+    DUPLICATE_COPY: 1,
+    SAME_NAME_DIFF_SIZE: 2,
+    HARDLINKED: 3,
+    ONLY_IN_A: 4,
+  };
+
+  function getStatusPriority(status) {
+    return Object.prototype.hasOwnProperty.call(STATUS_PRIORITY, status) ? STATUS_PRIORITY[status] : 9;
+  }
+
+  function sortDisplayRows(list, sortBy) {
     const copy = list.slice();
     copy.sort((a, b) => {
       if (sortBy === "reclaim_desc") {
@@ -249,18 +265,274 @@
           return (b.size || 0) - (a.size || 0);
         }
       } else if (sortBy === "name_desc") {
-        return String(b.filename || "").localeCompare(String(a.filename || ""), undefined, { sensitivity: "base" });
+        return String(b.title || b.filename || "").localeCompare(String(a.title || a.filename || ""), undefined, {
+          numeric: true,
+          sensitivity: "base",
+        });
+      } else if (sortBy === "name_asc") {
+        return String(a.title || a.filename || "").localeCompare(String(b.title || b.filename || ""), undefined, {
+          numeric: true,
+          sensitivity: "base",
+        });
+      } else {
+        if ((a.statusPriority ?? 9) !== (b.statusPriority ?? 9)) {
+          return (a.statusPriority ?? 9) - (b.statusPriority ?? 9);
+        }
+        if ((b.reclaimable_bytes || 0) !== (a.reclaimable_bytes || 0)) {
+          return (b.reclaimable_bytes || 0) - (a.reclaimable_bytes || 0);
+        }
       }
-      return String(a.filename || "").localeCompare(String(b.filename || ""), undefined, { sensitivity: "base" });
+      return String(a.title || a.filename || "").localeCompare(String(b.title || b.filename || ""), undefined, {
+        numeric: true,
+        sensitivity: "base",
+      });
     });
     return copy;
+  }
+
+  function buildPackDisplayRows(filteredGroups) {
+    const asFileItem = (grp) => ({
+      kind: "file",
+      id: grp.id,
+      group: grp,
+      members: [grp],
+      title: grp.filename,
+      filename: grp.filename,
+      size: grp.size || 0,
+      reclaimable_bytes: grp.reclaimable_bytes || 0,
+      statusPriority: getStatusPriority(grp.status),
+    });
+
+    if (state.viewMode !== "grouped") {
+      return sortDisplayRows(filteredGroups.map(asFileItem), state.sortBy);
+    }
+
+    const n = filteredGroups.length;
+    if (n === 0) return [];
+
+    const parent = Array.from({ length: n }, (_, i) => i);
+    const find = (x) => {
+      while (parent[x] !== x) {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+      }
+      return x;
+    };
+    const unite = (a, b) => {
+      const ra = find(a);
+      const rb = find(b);
+      if (ra !== rb) parent[rb] = ra;
+    };
+
+    const byTorrentKey = new Map();
+    for (let i = 0; i < n; i++) {
+      const grp = filteredGroups[i];
+      for (const t of grp.torrents || []) {
+        const hashLower = String(t.torrent_hash || "").toLowerCase();
+        if (!t.instance_id || !hashLower) continue;
+        const tk = `${t.instance_id}::${hashLower}`;
+        let entry = byTorrentKey.get(tk);
+        if (!entry) {
+          entry = { indices: [], torrent: t };
+          byTorrentKey.set(tk, entry);
+        }
+        entry.indices.push(i);
+      }
+    }
+
+    for (const entry of byTorrentKey.values()) {
+      if (entry.indices.length < 2) continue;
+      const first = entry.indices[0];
+      for (let k = 1; k < entry.indices.length; k++) {
+        unite(first, entry.indices[k]);
+      }
+    }
+
+    const components = new Map();
+    for (let i = 0; i < n; i++) {
+      const root = find(i);
+      let list = components.get(root);
+      if (!list) {
+        list = [];
+        components.set(root, list);
+      }
+      list.push(i);
+    }
+
+    const displayRows = [];
+    for (const idxs of components.values()) {
+      if (idxs.length === 1) {
+        displayRows.push(asFileItem(filteredGroups[idxs[0]]));
+        continue;
+      }
+
+      const members = idxs
+        .map((i) => filteredGroups[i])
+        .sort((a, b) =>
+          String(a.filename || "").localeCompare(String(b.filename || ""), undefined, {
+            numeric: true,
+            sensitivity: "base",
+          })
+        );
+
+      const torrentStats = new Map();
+      for (const m of members) {
+        const seenInMember = new Set();
+        for (const t of m.torrents || []) {
+          const hk = `${t.instance_id}::${String(t.torrent_hash || "").toLowerCase()}`;
+          if (!torrentStats.has(hk)) {
+            torrentStats.set(hk, { torrent: t, memberCount: 0 });
+          }
+          if (!seenInMember.has(hk)) {
+            seenInMember.add(hk);
+            torrentStats.get(hk).memberCount++;
+          }
+        }
+      }
+
+      const rankedTorrents = [...torrentStats.values()].sort((a, b) => {
+        if (b.memberCount !== a.memberCount) return b.memberCount - a.memberCount;
+        const bfc = b.torrent.torrent_file_count || 0;
+        const afc = a.torrent.torrent_file_count || 0;
+        if (bfc !== afc) return bfc - afc;
+        const aKey = `${a.torrent.instance_id}::${String(a.torrent.torrent_hash || "").toLowerCase()}`;
+        const bKey = `${b.torrent.instance_id}::${String(b.torrent.torrent_hash || "").toLowerCase()}`;
+        return aKey.localeCompare(bKey);
+      });
+
+      const primaryTorrent = rankedTorrents[0] ? rankedTorrents[0].torrent : null;
+      const uniqueTorrents = rankedTorrents.map((r) => r.torrent);
+      const packId = primaryTorrent
+        ? `pack:${primaryTorrent.instance_id}:${String(primaryTorrent.torrent_hash || "").toLowerCase()}`
+        : `pack:${members.map((m) => m.id).join(",")}`;
+      const title = (primaryTorrent && primaryTorrent.torrent_name) || members[0].filename || "Torrent Pack";
+      const totalTorrentFiles = uniqueTorrents.reduce((mx, t) => Math.max(mx, t.torrent_file_count || 0), 0);
+
+      let size = 0;
+      let reclaimable = 0;
+      const statusCounts = {};
+      const arrCounts = {};
+      let anySeeding = false;
+      let anyUnregistered = false;
+      let anyError = false;
+      let anyDownloading = false;
+      let hasArrIssue = false;
+      let hasCanImport = false;
+      let hasCanRescan = false;
+      let canHardlink = false;
+      let canDeleteFiles = false;
+      let anySyncingArr = false;
+      let maxNlink = 0;
+      const foldersA = new Map();
+      const foldersB = new Map();
+      let repArrMatch = null;
+
+      for (const m of members) {
+        size += m.size || 0;
+        reclaimable += m.reclaimable_bytes || 0;
+        statusCounts[m.status] = (statusCounts[m.status] || 0) + 1;
+        const as = m.arr_summary || "NOT_IN_ARR";
+        arrCounts[as] = (arrCounts[as] || 0) + 1;
+        if (m.has_arr_issue) hasArrIssue = true;
+        if ((m.arr_matches || []).some((a) => a.can_import)) hasCanImport = true;
+        if ((m.arr_matches || []).some((a) => a.can_rescan)) hasCanRescan = true;
+        if (m.can_hardlink && (m.hardlink_pairs || []).length > 0) canHardlink = true;
+        if ((m.all_paths || []).length > 0 && (m.seeding_summary === "UNTRACKED" || m.status === "ORPHANED_IN_B")) {
+          canDeleteFiles = true;
+        }
+        if (state.pendingArrRefreshGroups.has(m.id)) anySyncingArr = true;
+        for (const f of m.folder_a_files || []) {
+          if (!foldersA.has(f.folder_label)) foldersA.set(f.folder_label, f.abs_path);
+          if ((f.nlink || 0) > maxNlink) maxNlink = f.nlink || 0;
+        }
+        for (const f of m.folder_b_files || []) {
+          if (!foldersB.has(f.folder_label)) foldersB.set(f.folder_label, f.abs_path);
+          if ((f.nlink || 0) > maxNlink) maxNlink = f.nlink || 0;
+        }
+        if (!repArrMatch && (m.arr_matches || []).length > 0) {
+          repArrMatch = m.arr_matches[0];
+        }
+      }
+
+      for (const t of uniqueTorrents) {
+        if (t.tracker_health === "UNREGISTERED") anyUnregistered = true;
+        else if (t.tracker_health === "TRACKER_ERROR" || t.tracker_health === "LOCAL_ERROR") anyError = true;
+        if (t.is_seeding) anySeeding = true;
+        else if (t.seeding_status === "downloading") anyDownloading = true;
+      }
+
+      let seedingSummary = "UNTRACKED";
+      if (anyUnregistered && !anySeeding) seedingSummary = "UNREGISTERED";
+      else if (anyError && !anySeeding) seedingSummary = "ERROR";
+      else if (anySeeding) seedingSummary = "SEEDING";
+      else if (anyDownloading) seedingSummary = "DOWNLOADING";
+      else if (uniqueTorrents.length > 0) seedingSummary = "PAUSED";
+
+      const orderedStatuses = Object.keys(statusCounts).sort((a, b) => getStatusPriority(a) - getStatusPriority(b));
+      const primaryStatus = orderedStatuses[0] || members[0].status;
+      const arrPriority = [
+        "IN_QUEUE_BLOCKED",
+        "WANTED_NOT_IMPORTED",
+        "UNLINKED_IN_LIBRARY",
+        "REPLACED_IN_ARR",
+        "IMPORTED",
+        "NOT_IN_ARR",
+        "UNCONFIGURED",
+      ];
+      let primaryArrSummary = members[0].arr_summary || "NOT_IN_ARR";
+      for (const ap of arrPriority) {
+        if (arrCounts[ap] > 0) {
+          primaryArrSummary = ap;
+          break;
+        }
+      }
+
+      displayRows.push({
+        kind: "pack",
+        id: packId,
+        title,
+        filename: title,
+        members,
+        primaryTorrent,
+        uniqueTorrents,
+        torrents: uniqueTorrents,
+        totalTorrentFiles,
+        size,
+        reclaimable_bytes: reclaimable,
+        status: primaryStatus,
+        statusPriority: getStatusPriority(primaryStatus),
+        statusCounts,
+        hasMixedStatus: orderedStatuses.length > 1,
+        sole_copy_on_disk: members.every((m) => m.sole_copy_on_disk),
+        external_hardlink_count: members.reduce((mx, m) => Math.max(mx, m.external_hardlink_count || 0), 0),
+        seeding_summary: seedingSummary,
+        has_tracker_issue: anyUnregistered || anyError,
+        has_unregistered: anyUnregistered,
+        arr_summary: primaryArrSummary,
+        arrCounts,
+        hasMixedArr: Object.keys(arrCounts).length > 1,
+        hasArrIssue,
+        repArrMatch,
+        hasCanImport,
+        hasCanRescan,
+        hasErroredTorrents: uniqueTorrents.some((t) => Boolean(t.tracker_health)),
+        canHardlink,
+        canDeleteFiles,
+        anySyncingArr,
+        foldersA,
+        foldersB,
+        maxNlink,
+      });
+    }
+
+    return sortDisplayRows(displayRows, state.sortBy);
   }
 
   function getFilteredGroups() {
     if (!state.scan || !Array.isArray(state.scan.groups)) return [];
     const q = state.search.trim().toLowerCase();
 
-    const filtered = state.scan.groups.filter((grp) => {
+    return state.scan.groups.filter((grp) => {
       if (state.activeTab === "ARR_ISSUE") {
         if (!grp.has_arr_issue) return false;
       } else if (state.activeTab === "TRACKER_ISSUE") {
@@ -308,7 +580,6 @@
 
       return true;
     });
-    return sortGroups(filtered, state.sortBy);
   }
 
   function renderStatusBadge(grp) {
@@ -379,7 +650,7 @@
         <div class="folder-entry-head">
           <span class="folder-role-tag">${escapeHtml(badgeLabel)}: ${escapeHtml(file.folder_label)}</span>
           <span>
-            <span class="inode-tag">#${escapeHtml(file.inode)}</span>
+            <span class="inode-tag">#${escapeHtml(file.inode_str || file.inode)}</span>
             <span class="nlink-badge">nlink:${escapeHtml(file.nlink)}</span>
           </span>
         </div>
@@ -415,7 +686,7 @@
     return m.year > 0 ? `${m.title} (${m.year})` : m.title;
   }
 
-  function renderGroupDetailRow(grp) {
+  function renderGroupDetailRow(grp, isPackChild = false) {
     const missingAHtml =
       grp.status === "ORPHANED_IN_B"
         ? `<div class="missing-in-a">Missing from Folder A (original deleted)</div>`
@@ -488,7 +759,7 @@
               .join("");
 
     return `
-      <tr class="detail-row" data-detail-for="${escapeHtml(grp.id)}">
+      <tr class="detail-row ${isPackChild ? "pack-child-detail-row" : ""}" data-detail-for="${escapeHtml(grp.id)}">
         <td colspan="7">
           <div class="detail-panel">
             <div class="detail-grid">
@@ -568,13 +839,34 @@
     return `<div class="cell-sub-trunc" title="${escapeHtml(primary.status_message || label)}">${escapeHtml(label)}</div>`;
   }
 
-  function updatePaginationUi(totalCount, startIdx, endIdx, totalPages, pageGroups) {
+  function shortStatusLabel(s) {
+    switch (s) {
+      case "ORPHANED_IN_B":
+        return "Orphaned";
+      case "DUPLICATE_COPY":
+        return "Dup";
+      case "HARDLINKED":
+        return "Hardlinked";
+      case "ONLY_IN_A":
+        return "Only A";
+      case "SAME_NAME_DIFF_SIZE":
+        return "Diff Size";
+      default:
+        return s;
+    }
+  }
+
+  function updatePaginationUi(totalDisplayCount, totalFileCount, startIdx, endIdx, totalPages, pageItems) {
     const bar = $("paginationBar");
-    if (totalCount === 0) {
+    if (totalDisplayCount === 0) {
       bar.hidden = true;
     } else {
       bar.hidden = false;
-      $("paginationInfo").textContent = `Showing ${(startIdx + 1).toLocaleString()}\u2013${endIdx.toLocaleString()} of ${totalCount.toLocaleString()} item(s)`;
+      const suffix =
+        state.viewMode === "grouped" && totalDisplayCount !== totalFileCount
+          ? ` (${totalFileCount.toLocaleString()} files)`
+          : "";
+      $("paginationInfo").textContent = `Showing ${(startIdx + 1).toLocaleString()}\u2013${endIdx.toLocaleString()} of ${totalDisplayCount.toLocaleString()} item(s)${suffix}`;
       $("pageIndicator").textContent = `Page ${state.page} / ${totalPages}`;
       $("pageFirstBtn").disabled = state.page <= 1;
       $("pagePrevBtn").disabled = state.page <= 1;
@@ -584,169 +876,340 @@
 
     const expandBtn = $("expandPageBtn");
     if (expandBtn) {
-      const anyPageExpanded = pageGroups.length > 0 && pageGroups.every((g) => state.expandedGroupIds.has(g.id));
+      const anyPageExpanded =
+        pageItems.length > 0 &&
+        pageItems.every((it) =>
+          it.kind === "pack" ? state.expandedPackIds.has(it.id) : state.expandedGroupIds.has(it.id)
+        );
       expandBtn.textContent = anyPageExpanded ? "Collapse Page" : "Expand Page";
-      expandBtn.disabled = pageGroups.length === 0;
+      expandBtn.disabled = pageItems.length === 0;
     }
+  }
+
+  function renderFileRow(grp, isPackChild = false) {
+    const checked = state.selectedGroupIds.has(grp.id) ? "checked" : "";
+    const isExpanded = state.expandedGroupIds.has(grp.id);
+    const arrMatches = grp.arr_matches || [];
+
+    const reclaimClass =
+      grp.reclaimable_bytes > 0
+        ? grp.status === "ORPHANED_IN_B"
+          ? "reclaim-danger"
+          : "reclaim-highlight"
+        : "reclaim-zero";
+
+    const actionBtns = [];
+    if (arrMatches.some((m) => m.can_import)) {
+      actionBtns.push(
+        `<button class="btn btn-amber btn-xs row-arr-import" data-group-id="${escapeHtml(grp.id)}" type="button" title="Tell Radarr/Sonarr to import this file into its library folder">Import</button>`
+      );
+    }
+    if (arrMatches.some((m) => m.can_rescan)) {
+      actionBtns.push(
+        `<button class="btn btn-secondary btn-xs row-arr-rescan" data-group-id="${escapeHtml(grp.id)}" type="button" title="Scan Arr's existing library folder to link this file without moving it">Rescan</button>`
+      );
+    }
+    const erroredTorrents = grp.torrents.filter((t) => Boolean(t.tracker_health));
+    if (erroredTorrents.length > 0) {
+      const errBtnText = grp.has_unregistered ? "Del Unreg" : "Del Err";
+      const errTitle = grp.has_unregistered
+        ? "Remove unregistered torrent(s) from qBittorrent (healthy torrents stay)"
+        : "Remove errored torrent(s) from qBittorrent (healthy torrents stay)";
+      actionBtns.push(
+        `<button class="btn btn-outline-danger btn-xs row-delete-errored-torrent" data-group-id="${escapeHtml(grp.id)}" type="button" title="${errTitle}">${errBtnText}</button>`
+      );
+    }
+    if (grp.torrents.length > 0) {
+      actionBtns.push(
+        `<button class="btn btn-danger btn-xs row-delete-torrent" data-group-id="${escapeHtml(grp.id)}" type="button" title="Remove matching torrent(s) from qBittorrent (with optional data file delete)">Del qBit</button>`
+      );
+    }
+    if (grp.can_hardlink && grp.hardlink_pairs.length > 0) {
+      actionBtns.push(
+        `<button class="btn btn-amber btn-xs row-hardlink" data-group-id="${escapeHtml(grp.id)}" type="button" title="Replace duplicate copies with hardlinks to reclaim space">Hardlink</button>`
+      );
+    }
+    if (grp.all_paths.length > 0 && (grp.seeding_summary === "UNTRACKED" || grp.status === "ORPHANED_IN_B")) {
+      actionBtns.push(
+        `<button class="btn btn-outline-danger btn-xs row-delete-file" data-group-id="${escapeHtml(grp.id)}" type="button" title="Delete file(s) directly from disk">Del File</button>`
+      );
+    }
+    actionBtns.push(
+      `<button class="btn btn-secondary btn-xs row-refresh" data-group-id="${escapeHtml(grp.id)}" type="button" title="Refresh disk, qBittorrent & Radarr/Sonarr status for this item">&#8635;</button>`
+    );
+
+    const arrSyncHtml = state.pendingArrRefreshGroups.has(grp.id)
+      ? `<div class="arr-sync-badge">Syncing Arr...</div>`
+      : "";
+
+    const mainRowHtml = `
+      <tr class="main-row ${isPackChild ? "pack-child-row" : ""} ${isExpanded ? "is-expanded" : ""}" data-group-id="${escapeHtml(grp.id)}">
+        <td class="col-check">
+          <div class="row-check-wrap">
+            <input type="checkbox" class="row-checkbox" data-group-id="${escapeHtml(grp.id)}" ${checked} />
+            <button class="row-expand-btn ${isExpanded ? "expanded" : ""}" data-group-id="${escapeHtml(grp.id)}" type="button" title="${isExpanded ? "Collapse details" : "Expand full paths, torrents & Arr details"}" aria-label="Toggle row details">&#9656;</button>
+          </div>
+        </td>
+        <td class="col-file">
+          <div class="file-name" title="${escapeHtml(grp.filename)}">${escapeHtml(grp.filename)}</div>
+          <div class="file-meta">
+            <span>${formatBytes(grp.size)}</span>
+            <span>${escapeHtml(grp.ext || "file")}</span>
+          </div>
+        </td>
+        <td class="col-folders">
+          <div class="cell-stack">
+            ${renderStatusBadge(grp)}
+            ${formatCompactFolders(grp)}
+          </div>
+        </td>
+        <td class="col-qbit">
+          <div class="cell-stack">
+            ${renderSeedingBadge(grp)}
+            ${formatCompactQbitSummary(grp)}
+          </div>
+        </td>
+        <td class="col-arr">
+          <div class="cell-stack">
+            ${renderArrBadge(grp.arr_summary)}
+            ${formatCompactArrSummary(grp)}
+            ${arrSyncHtml}
+          </div>
+        </td>
+        <td class="col-reclaim">
+          <div class="reclaim-bytes ${reclaimClass}">${grp.reclaimable_bytes > 0 ? formatBytes(grp.reclaimable_bytes) : "—"}</div>
+          ${
+            grp.status === "DUPLICATE_COPY" && !grp.can_hardlink
+              ? `<div class="cell-sub-trunc" title="Cross-device (cannot hardlink)">Cross-dev</div>`
+              : ""
+          }
+        </td>
+        <td class="col-actions">
+          <div class="row-actions">${actionBtns.join("")}</div>
+        </td>
+      </tr>
+    `;
+
+    return isExpanded ? mainRowHtml + renderGroupDetailRow(grp, isPackChild) : mainRowHtml;
+  }
+
+  function formatCompactPackFolders(pack) {
+    const chips = [];
+    for (const [label, path] of pack.foldersA.entries()) {
+      chips.push(`<span class="mini-chip mini-chip-primary" title="Folder A: ${escapeHtml(path)}">${escapeHtml(label)}</span>`);
+    }
+    for (const [label, path] of pack.foldersB.entries()) {
+      chips.push(`<span class="mini-chip" title="Folder B: ${escapeHtml(path)}">${escapeHtml(label)}</span>`);
+    }
+    const nlinkTag = pack.maxNlink > 0 ? `<span class="nlink-badge">nlink:${pack.maxNlink}</span>` : "";
+    return `<div class="cell-badges">${chips.join("")}${nlinkTag}</div>`;
+  }
+
+  function formatCompactPackArr(pack) {
+    if (pack.arr_summary === "UNCONFIGURED") {
+      return `<div class="cell-sub-trunc">Not configured</div>`;
+    }
+    if (pack.hasMixedArr) {
+      const labels = {
+        IMPORTED: "imported",
+        WANTED_NOT_IMPORTED: "wanted",
+        IN_QUEUE_BLOCKED: "blocked",
+        UNLINKED_IN_LIBRARY: "unlinked",
+        REPLACED_IN_ARR: "replaced",
+        NOT_IN_ARR: "not in arr",
+      };
+      const parts = Object.entries(pack.arrCounts).map(([k, v]) => `${v} ${labels[k] || k}`);
+      return `<div class="cell-sub-trunc" title="${escapeHtml(parts.join(", "))}">${escapeHtml(parts.join(", "))}</div>`;
+    }
+    if (!pack.repArrMatch) {
+      return `<div class="cell-sub-trunc">No match</div>`;
+    }
+    const m = pack.repArrMatch;
+    if (m.existing_file_name) {
+      return `<div class="cell-sub-trunc" title="${escapeHtml(m.existing_file_path || m.existing_file_name)}">Replaced in library</div>`;
+    }
+    return `<div class="cell-sub-trunc">${escapeHtml(m.instance_name)}: ${escapeHtml(m.title)} (${pack.members.length} files)</div>`;
+  }
+
+  function renderPackRow(pack) {
+    const allSelected = pack.members.every((m) => state.selectedGroupIds.has(m.id));
+    const isExpanded = state.expandedPackIds.has(pack.id);
+    const reclaimClass =
+      pack.reclaimable_bytes > 0
+        ? pack.status === "ORPHANED_IN_B"
+          ? "reclaim-danger"
+          : "reclaim-highlight"
+        : "reclaim-zero";
+
+    const actionBtns = [];
+    if (pack.hasCanImport) {
+      actionBtns.push(
+        `<button class="btn btn-amber btn-xs pack-arr-import" data-pack-id="${escapeHtml(pack.id)}" type="button" title="Import all eligible episodes in this pack into Radarr/Sonarr">Import Pack</button>`
+      );
+    }
+    if (pack.hasCanRescan) {
+      actionBtns.push(
+        `<button class="btn btn-secondary btn-xs pack-arr-rescan" data-pack-id="${escapeHtml(pack.id)}" type="button" title="Rescan Arr's library folder for this pack">Rescan</button>`
+      );
+    }
+    if (pack.hasErroredTorrents) {
+      const errBtnText = pack.has_unregistered ? "Del Unreg" : "Del Err";
+      actionBtns.push(
+        `<button class="btn btn-outline-danger btn-xs pack-delete-errored-torrent" data-pack-id="${escapeHtml(pack.id)}" type="button" title="Remove errored/unregistered torrent(s) from qBittorrent">${errBtnText}</button>`
+      );
+    }
+    if (pack.uniqueTorrents.length > 0) {
+      actionBtns.push(
+        `<button class="btn btn-danger btn-xs pack-delete-torrent" data-pack-id="${escapeHtml(pack.id)}" type="button" title="Remove matching torrent(s) for this pack from qBittorrent">Del qBit</button>`
+      );
+    }
+    if (pack.canHardlink) {
+      actionBtns.push(
+        `<button class="btn btn-amber btn-xs pack-hardlink" data-pack-id="${escapeHtml(pack.id)}" type="button" title="Convert duplicate copies in this pack to hardlinks">Hardlink</button>`
+      );
+    }
+    if (pack.canDeleteFiles) {
+      actionBtns.push(
+        `<button class="btn btn-outline-danger btn-xs pack-delete-file" data-pack-id="${escapeHtml(pack.id)}" type="button" title="Delete orphaned/untracked files in this pack directly from disk">Del Files</button>`
+      );
+    }
+    actionBtns.push(
+      `<button class="btn btn-secondary btn-xs pack-refresh" data-pack-id="${escapeHtml(pack.id)}" type="button" title="Refresh disk, qBittorrent & Arr status for all files in this pack">&#8635;</button>`
+    );
+
+    const fileMetaExtra =
+      pack.totalTorrentFiles > pack.members.length
+        ? `${pack.members.length} files (${pack.totalTorrentFiles} in torrent)`
+        : `${pack.members.length} files`;
+
+    const mixedStatusNote = pack.hasMixedStatus
+      ? `<div class="cell-sub-trunc">${Object.entries(pack.statusCounts).map(([k, v]) => `${v} ${shortStatusLabel(k)}`).join(", ")}</div>`
+      : formatCompactPackFolders(pack);
+
+    const arrSyncHtml = pack.anySyncingArr ? `<div class="arr-sync-badge">Syncing Arr...</div>` : "";
+
+    const packMainHtml = `
+      <tr class="main-row pack-row ${isExpanded ? "is-expanded" : ""}" data-pack-id="${escapeHtml(pack.id)}">
+        <td class="col-check">
+          <div class="row-check-wrap">
+            <input type="checkbox" class="pack-checkbox" data-pack-id="${escapeHtml(pack.id)}" ${allSelected ? "checked" : ""} />
+            <button class="row-expand-btn pack-expand-btn ${isExpanded ? "expanded" : ""}" data-pack-id="${escapeHtml(pack.id)}" type="button" title="${isExpanded ? "Collapse pack files" : "Show all episodes/files inside this torrent pack"}" aria-label="Toggle pack files">&#9656;</button>
+          </div>
+        </td>
+        <td class="col-file">
+          <div class="file-name-wrap">
+            <span class="pack-badge">PACK</span>
+            <div class="file-name" title="${escapeHtml(pack.title)}">${escapeHtml(pack.title)}</div>
+          </div>
+          <div class="file-meta">
+            <span>${formatBytes(pack.size)}</span>
+            <span>${escapeHtml(fileMetaExtra)}</span>
+          </div>
+        </td>
+        <td class="col-folders">
+          <div class="cell-stack">
+            ${renderStatusBadge(pack)}
+            ${mixedStatusNote}
+          </div>
+        </td>
+        <td class="col-qbit">
+          <div class="cell-stack">
+            ${renderSeedingBadge(pack)}
+            ${formatCompactQbitSummary({ torrents: pack.uniqueTorrents })}
+          </div>
+        </td>
+        <td class="col-arr">
+          <div class="cell-stack">
+            ${renderArrBadge(pack.arr_summary)}
+            ${formatCompactPackArr(pack)}
+            ${arrSyncHtml}
+          </div>
+        </td>
+        <td class="col-reclaim">
+          <div class="reclaim-bytes ${reclaimClass}">${pack.reclaimable_bytes > 0 ? formatBytes(pack.reclaimable_bytes) : "—"}</div>
+        </td>
+        <td class="col-actions">
+          <div class="row-actions">${actionBtns.join("")}</div>
+        </td>
+      </tr>
+    `;
+
+    if (!isExpanded) return packMainHtml;
+    return packMainHtml + pack.members.map((m) => renderFileRow(m, true)).join("");
   }
 
   function renderTable() {
     const tbody = $("auditTableBody");
-    const filtered = getFilteredGroups();
+    const filteredGroups = getFilteredGroups();
+    const displayRows = buildPackDisplayRows(filteredGroups);
+    state.currentPackMap.clear();
+    for (const item of displayRows) {
+      if (item.kind === "pack") {
+        state.currentPackMap.set(item.id, item);
+      }
+    }
 
     if (!state.scan) {
       tbody.innerHTML = `<tr><td colspan="7" class="empty-table-cell">No scan data yet. Open <strong>Settings</strong> to add your folders and click <strong>Scan Now</strong>.</td></tr>`;
-      updatePaginationUi(0, 0, 0, 1, []);
+      updatePaginationUi(0, 0, 0, 0, 1, []);
       updateSelectionControls([], []);
       return;
     }
 
-    if (filtered.length === 0) {
+    if (displayRows.length === 0) {
       tbody.innerHTML = `<tr><td colspan="7" class="empty-table-cell">No files match the current filter criteria.</td></tr>`;
-      updatePaginationUi(0, 0, 0, 1, []);
+      updatePaginationUi(0, 0, 0, 0, 1, []);
       updateSelectionControls([], []);
       return;
     }
 
-    const totalPages = Math.max(1, Math.ceil(filtered.length / state.pageSize));
+    const totalPages = Math.max(1, Math.ceil(displayRows.length / state.pageSize));
     if (state.page > totalPages) state.page = totalPages;
     if (state.page < 1) state.page = 1;
     const startIdx = (state.page - 1) * state.pageSize;
-    const endIdx = Math.min(filtered.length, startIdx + state.pageSize);
-    const pageGroups = filtered.slice(startIdx, endIdx);
+    const endIdx = Math.min(displayRows.length, startIdx + state.pageSize);
+    const pageItems = displayRows.slice(startIdx, endIdx);
 
-    tbody.innerHTML = pageGroups
-      .map((grp) => {
-        const checked = state.selectedGroupIds.has(grp.id) ? "checked" : "";
-        const isExpanded = state.expandedGroupIds.has(grp.id);
-        const arrMatches = grp.arr_matches || [];
-
-        const reclaimClass =
-          grp.reclaimable_bytes > 0
-            ? grp.status === "ORPHANED_IN_B"
-              ? "reclaim-danger"
-              : "reclaim-highlight"
-            : "reclaim-zero";
-
-        const actionBtns = [];
-        if (arrMatches.some((m) => m.can_import)) {
-          actionBtns.push(
-            `<button class="btn btn-amber btn-xs row-arr-import" data-group-id="${escapeHtml(grp.id)}" type="button" title="Tell Radarr/Sonarr to import this file into its library folder">Import</button>`
-          );
-        }
-        if (arrMatches.some((m) => m.can_rescan)) {
-          actionBtns.push(
-            `<button class="btn btn-secondary btn-xs row-arr-rescan" data-group-id="${escapeHtml(grp.id)}" type="button" title="Scan Arr's existing library folder to link this file without moving it">Rescan</button>`
-          );
-        }
-        const erroredTorrents = grp.torrents.filter((t) => Boolean(t.tracker_health));
-        if (erroredTorrents.length > 0) {
-          const errBtnText = grp.has_unregistered ? "Del Unreg" : "Del Err";
-          const errTitle = grp.has_unregistered
-            ? "Remove unregistered torrent(s) from qBittorrent (healthy torrents stay)"
-            : "Remove errored torrent(s) from qBittorrent (healthy torrents stay)";
-          actionBtns.push(
-            `<button class="btn btn-outline-danger btn-xs row-delete-errored-torrent" data-group-id="${escapeHtml(grp.id)}" type="button" title="${errTitle}">${errBtnText}</button>`
-          );
-        }
-        if (grp.torrents.length > 0) {
-          actionBtns.push(
-            `<button class="btn btn-danger btn-xs row-delete-torrent" data-group-id="${escapeHtml(grp.id)}" type="button" title="Remove matching torrent(s) from qBittorrent (with optional data file delete)">Del qBit</button>`
-          );
-        }
-        if (grp.can_hardlink && grp.hardlink_pairs.length > 0) {
-          actionBtns.push(
-            `<button class="btn btn-amber btn-xs row-hardlink" data-group-id="${escapeHtml(grp.id)}" type="button" title="Replace duplicate copies with hardlinks to reclaim space">Hardlink</button>`
-          );
-        }
-        if (grp.all_paths.length > 0 && (grp.seeding_summary === "UNTRACKED" || grp.status === "ORPHANED_IN_B")) {
-          actionBtns.push(
-            `<button class="btn btn-outline-danger btn-xs row-delete-file" data-group-id="${escapeHtml(grp.id)}" type="button" title="Delete file(s) directly from disk">Del File</button>`
-          );
-        }
-        actionBtns.push(
-          `<button class="btn btn-secondary btn-xs row-refresh" data-group-id="${escapeHtml(grp.id)}" type="button" title="Refresh disk, qBittorrent & Radarr/Sonarr status for this item">&#8635;</button>`
-        );
-
-        const arrSyncHtml = state.pendingArrRefreshGroups.has(grp.id)
-          ? `<div class="arr-sync-badge">Syncing Arr...</div>`
-          : "";
-
-        const mainRowHtml = `
-          <tr class="main-row ${isExpanded ? "is-expanded" : ""}" data-group-id="${escapeHtml(grp.id)}">
-            <td class="col-check">
-              <div class="row-check-wrap">
-                <input type="checkbox" class="row-checkbox" data-group-id="${escapeHtml(grp.id)}" ${checked} />
-                <button class="row-expand-btn ${isExpanded ? "expanded" : ""}" data-group-id="${escapeHtml(grp.id)}" type="button" title="${isExpanded ? "Collapse details" : "Expand full paths, torrents & Arr details"}" aria-label="Toggle row details">&#9656;</button>
-              </div>
-            </td>
-            <td class="col-file">
-              <div class="file-name" title="${escapeHtml(grp.filename)}">${escapeHtml(grp.filename)}</div>
-              <div class="file-meta">
-                <span>${formatBytes(grp.size)}</span>
-                <span>${escapeHtml(grp.ext || "file")}</span>
-              </div>
-            </td>
-            <td class="col-folders">
-              <div class="cell-stack">
-                ${renderStatusBadge(grp)}
-                ${formatCompactFolders(grp)}
-              </div>
-            </td>
-            <td class="col-qbit">
-              <div class="cell-stack">
-                ${renderSeedingBadge(grp)}
-                ${formatCompactQbitSummary(grp)}
-              </div>
-            </td>
-            <td class="col-arr">
-              <div class="cell-stack">
-                ${renderArrBadge(grp.arr_summary)}
-                ${formatCompactArrSummary(grp)}
-                ${arrSyncHtml}
-              </div>
-            </td>
-            <td class="col-reclaim">
-              <div class="reclaim-bytes ${reclaimClass}">${grp.reclaimable_bytes > 0 ? formatBytes(grp.reclaimable_bytes) : "—"}</div>
-              ${
-                grp.status === "DUPLICATE_COPY" && !grp.can_hardlink
-                  ? `<div class="cell-sub-trunc" title="Cross-device (cannot hardlink)">Cross-dev</div>`
-                  : ""
-              }
-            </td>
-            <td class="col-actions">
-              <div class="row-actions">${actionBtns.join("")}</div>
-            </td>
-          </tr>
-        `;
-
-        return isExpanded ? mainRowHtml + renderGroupDetailRow(grp) : mainRowHtml;
-      })
+    tbody.innerHTML = pageItems
+      .map((item) => (item.kind === "pack" ? renderPackRow(item) : renderFileRow(item.group, false)))
       .join("");
 
-    updatePaginationUi(filtered.length, startIdx, endIdx, totalPages, pageGroups);
-    updateSelectionControls(filtered, pageGroups);
+    // Apply indeterminate state on partially-selected pack checkboxes (DOM property only).
+    tbody.querySelectorAll(".pack-checkbox").forEach((cb) => {
+      const pack = state.currentPackMap.get(cb.dataset.packId);
+      if (!pack) return;
+      const selCount = pack.members.filter((m) => state.selectedGroupIds.has(m.id)).length;
+      cb.checked = selCount === pack.members.length;
+      cb.indeterminate = selCount > 0 && selCount < pack.members.length;
+    });
+
+    updatePaginationUi(displayRows.length, filteredGroups.length, startIdx, endIdx, totalPages, pageItems);
+    updateSelectionControls(filteredGroups, pageItems);
   }
 
-  function updateSelectionControls(filteredRows, pageRows = null) {
-    const currentPageRows = pageRows || filteredRows;
-    const pageIds = new Set(currentPageRows.map((g) => g.id));
-    const selectedOnPage = [...state.selectedGroupIds].filter((id) => pageIds.has(id));
+  function updateSelectionControls(filteredGroups, pageItems = []) {
+    const pageGroupIds = new Set();
+    for (const item of pageItems) {
+      for (const m of item.members || [item.group]) {
+        if (m && m.id) pageGroupIds.add(m.id);
+      }
+    }
+    const selectedOnPage = [...state.selectedGroupIds].filter((id) => pageGroupIds.has(id));
     const selectAll = $("selectAllCheckbox");
-    selectAll.checked = currentPageRows.length > 0 && selectedOnPage.length === currentPageRows.length;
-    selectAll.indeterminate = selectedOnPage.length > 0 && selectedOnPage.length < currentPageRows.length;
+    selectAll.checked = pageGroupIds.size > 0 && selectedOnPage.length === pageGroupIds.size;
+    selectAll.indeterminate = selectedOnPage.length > 0 && selectedOnPage.length < pageGroupIds.size;
 
     const selectedGroups = getSelectedGroups();
     $("bulkBar").hidden = selectedGroups.length === 0;
     $("selectionBadge").textContent = `${selectedGroups.length.toLocaleString()} selected`;
 
-    const allFilteredIds = new Set(filteredRows.map((g) => g.id));
+    const allFilteredIds = new Set(filteredGroups.map((g) => g.id));
     const selectedInFilter = [...state.selectedGroupIds].filter((id) => allFilteredIds.has(id));
     const selAllMatchBtn = $("selectAllMatchingBtn");
     if (selAllMatchBtn) {
-      if (selectedGroups.length > 0 && filteredRows.length > currentPageRows.length && selectedInFilter.length < filteredRows.length) {
+      if (selectedGroups.length > 0 && filteredGroups.length > pageGroupIds.size && selectedInFilter.length < filteredGroups.length) {
         selAllMatchBtn.hidden = false;
-        selAllMatchBtn.textContent = `Select all ${filteredRows.length.toLocaleString()} matching`;
+        selAllMatchBtn.textContent = `Select all ${filteredGroups.length.toLocaleString()} matching`;
       } else {
         selAllMatchBtn.hidden = true;
       }
@@ -794,7 +1257,9 @@
       state.scan = await apiFetch("/api/scan", { method: "POST" });
       state.page = 1;
       state.selectedGroupIds.clear();
+      state.expandedPackIds.clear();
       state.expandedGroupIds.clear();
+      state.currentPackMap.clear();
       renderAll();
       showToast(
         `Scan complete: ${state.scan.summary.total_files_scanned} files analyzed (${formatBytes(state.scan.summary.total_reclaimable_bytes)} reclaimable).`,
@@ -848,23 +1313,150 @@
     return [...paths];
   }
 
-  function buildQbitRelocatePreview(groups) {
-    const eligible = [];
-    const skippedMulti = [];
-    const seen = new Set();
-    for (const g of groups || []) {
+  function findPackSiblings(baseGroups) {
+    if (!state.scan || !Array.isArray(state.scan.groups)) {
+      return { importableSiblings: [], otherSiblings: [] };
+    }
+    const baseIds = new Set((baseGroups || []).map((g) => g.id));
+    const multiTorrentKeys = new Set();
+    for (const g of baseGroups || []) {
       for (const t of g.torrents || []) {
-        const k = `${t.instance_id}::${t.torrent_hash}`;
-        if (seen.has(k)) continue;
-        seen.add(k);
-        if ((t.torrent_file_count || 0) === 1) {
-          eligible.push({ group_id: g.id, torrent: t });
-        } else {
-          skippedMulti.push({ group_id: g.id, torrent: t });
+        if ((t.torrent_file_count || 0) > 1 && t.instance_id && t.torrent_hash) {
+          multiTorrentKeys.add(`${t.instance_id}::${String(t.torrent_hash).toLowerCase()}`);
         }
       }
     }
-    return { eligible, skippedMulti };
+    if (multiTorrentKeys.size === 0) {
+      return { importableSiblings: [], otherSiblings: [] };
+    }
+    const importableSiblings = [];
+    const otherSiblings = [];
+    for (const g of state.scan.groups) {
+      if (baseIds.has(g.id)) continue;
+      const sharesMulti = (g.torrents || []).some(
+        (t) =>
+          (t.torrent_file_count || 0) > 1 &&
+          multiTorrentKeys.has(`${t.instance_id}::${String(t.torrent_hash || "").toLowerCase()}`)
+      );
+      if (!sharesMulti) continue;
+      if ((g.arr_matches || []).some((m) => m.can_import)) {
+        importableSiblings.push(g);
+      } else {
+        otherSiblings.push(g);
+      }
+    }
+    return { importableSiblings, otherSiblings };
+  }
+
+  function updatePackSiblingsOptionUi(type, baseGroups, mode) {
+    const row = $("packSiblingsOptionRow");
+    const chk = $("includePackSiblingsCheckbox");
+    const lbl = $("packSiblingsLabel");
+    const hint = $("packSiblingsHint");
+    if (!row || !chk || !lbl || !hint) return { importableSiblings: [], otherSiblings: [] };
+
+    const isArrImport = type === "arr-import" || type === "arr-fix";
+    const info = findPackSiblings(baseGroups);
+    if (!isArrImport || mode !== "move" || info.importableSiblings.length === 0) {
+      row.hidden = true;
+      return info;
+    }
+
+    row.hidden = false;
+    lbl.textContent = `Also Move ${info.importableSiblings.length} sibling episode(s) from the same multi-file torrent pack so qBittorrent can relocate cleanly`;
+    const sampleNames = info.importableSiblings
+      .slice(0, 3)
+      .map((g) => g.filename)
+      .join(", ");
+    const extraMore = info.importableSiblings.length > 3 ? ` (+${info.importableSiblings.length - 3} more)` : "";
+    const otherNote = info.otherSiblings.length > 0
+      ? ` • ${info.otherSiblings.length} sibling file(s) already imported or replaced in Arr`
+      : "";
+    hint.textContent = `Siblings: ${sampleNames}${extraMore}${otherNote}`;
+    return info;
+  }
+
+  function getEffectiveActionGroups(pendingAction) {
+    if (!pendingAction) return [];
+    const baseGroups = pendingAction.baseGroups || pendingAction.groups || [];
+    const type = pendingAction.type;
+    if (type !== "arr-import" && type !== "arr-fix") return baseGroups;
+    const mode = ($("arrImportModeSelect") && $("arrImportModeSelect").value) || "auto";
+    if (mode !== "move") return baseGroups;
+    const sibChk = $("includePackSiblingsCheckbox");
+    if (!sibChk || !sibChk.checked) return baseGroups;
+    const { importableSiblings } = findPackSiblings(baseGroups);
+    if (importableSiblings.length === 0) return baseGroups;
+    return [...baseGroups, ...importableSiblings];
+  }
+
+  function collectInspectInput(groups, importItems) {
+    const seenTorrents = new Set();
+    const torrents = [];
+    for (const g of groups || []) {
+      for (const t of g.torrents || []) {
+        const hk = `${t.instance_id}::${String(t.torrent_hash || "").toLowerCase()}`;
+        if (!t.instance_id || !t.torrent_hash || seenTorrents.has(hk)) continue;
+        seenTorrents.add(hk);
+        torrents.push({ instance_id: t.instance_id, torrent_hash: t.torrent_hash });
+      }
+    }
+
+    const pathSet = new Set();
+    for (const it of importItems || []) {
+      if (it.local_path) pathSet.add(it.local_path);
+    }
+    for (const g of groups || []) {
+      if (!(g.arr_matches || []).some((m) => m.can_import)) continue;
+      for (const p of g.all_paths || []) {
+        if (p) pathSet.add(p);
+      }
+    }
+    return { torrents, selected_local_paths: [...pathSet] };
+  }
+
+  function buildQbitRelocatePreview(groups, inspectResult = null) {
+    if (inspectResult && Array.isArray(inspectResult.torrents)) {
+      const eligible = [];
+      const blocked = [];
+      for (const t of inspectResult.torrents) {
+        if (t.can_relocate) eligible.push(t);
+        else blocked.push(t);
+      }
+      return {
+        fromInspect: true,
+        eligible,
+        blocked,
+        errors: inspectResult.errors || [],
+      };
+    }
+
+    const eligible = [];
+    const blocked = [];
+    const seen = new Set();
+    for (const g of groups || []) {
+      for (const t of g.torrents || []) {
+        const k = `${t.instance_id}::${String(t.torrent_hash || "").toLowerCase()}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        const item = {
+          instance_id: t.instance_id,
+          instance_name: t.instance_name,
+          torrent_hash: t.torrent_hash,
+          torrent_name: t.torrent_name,
+          file_count: t.torrent_file_count || 0,
+          companion_count: 0,
+          sample_count: 0,
+          can_relocate: (t.torrent_file_count || 0) === 1,
+          status: (t.torrent_file_count || 0) === 1 ? "ready" : "pending_inspect",
+          warnings: [],
+          files: [],
+        };
+        if (item.can_relocate) eligible.push(item);
+        else blocked.push(item);
+      }
+    }
+    return { fromInspect: false, eligible, blocked, errors: [] };
   }
 
   async function refreshGroupsInPlace(groupIds, waitDeletedPaths = [], includeArr = true, extraQbitHashes = null) {
@@ -891,7 +1483,9 @@
       state.scan = res.full_scan;
       state.page = 1;
       state.selectedGroupIds.clear();
+      state.expandedPackIds.clear();
       state.expandedGroupIds.clear();
+      state.currentPackMap.clear();
       state.pendingArrRefreshGroups.clear();
       renderAll();
       return res;
@@ -955,14 +1549,12 @@
       const refRes = await refreshGroupsInPlace(uniqueIds, [], true);
       if (epoch !== state.scanEpoch) return;
 
-      if (relocatePlan && relocatePlan.size > 0 && refRes && !refRes.full_scan) {
-        const relocateItems = [];
-        const extraHashesByInst = {};
-        const seenHash = new Set();
+      if (relocatePlan && relocatePlan.inspectedTorrents && relocatePlan.inspectedTorrents.length > 0 && refRes && !refRes.full_scan) {
+        const newPathByInode = new Map();
+        const newPathByOldPath = new Map();
 
         for (const updatedGrp of refRes.updated_groups || []) {
-          const plan = relocatePlan.get(updatedGrp.id);
-          if (!plan) continue;
+          const pre = relocatePlan.groupPreMoveMap.get(updatedGrp.id);
           const diskSet = new Set((updatedGrp.all_paths || []).map((p) => String(p).toLowerCase()));
           const imported = (updatedGrp.arr_matches || []).find(
             (m) => m.match_kind === "imported" && m.file_path && diskSet.has(String(m.file_path).toLowerCase())
@@ -973,21 +1565,71 @@
             (updatedGrp.all_paths && updatedGrp.all_paths[0]) ||
             "";
 
-          if (!candidatePath || plan.oldPaths.has(String(candidatePath).toLowerCase())) {
+          if (!candidatePath) continue;
+          if (pre && pre.oldPaths.has(String(candidatePath).toLowerCase())) {
             continue;
           }
-          for (const t of plan.torrents) {
-            const hk = `${t.instance_id}::${t.torrent_hash}`;
-            if (seenHash.has(hk)) continue;
-            seenHash.add(hk);
-            relocateItems.push({
-              instance_id: t.instance_id,
-              torrent_hash: t.torrent_hash,
-              new_local_path: candidatePath,
-            });
-            if (!extraHashesByInst[t.instance_id]) extraHashesByInst[t.instance_id] = [];
-            extraHashesByInst[t.instance_id].push(t.torrent_hash);
+
+          for (const f of [...(updatedGrp.folder_a_files || []), ...(updatedGrp.folder_b_files || [])]) {
+            const ino = f.inode_str || (f.inode ? String(f.inode) : "");
+            if (ino && ino !== "0") {
+              newPathByInode.set(`${f.device || 0}:${ino}`, candidatePath);
+            }
           }
+          if (pre) {
+            for (const ik of pre.inodeKeys || []) {
+              newPathByInode.set(ik, candidatePath);
+            }
+            for (const oldP of pre.oldPaths || []) {
+              newPathByOldPath.set(oldP, candidatePath);
+            }
+          }
+        }
+
+        const relocateItems = [];
+        const extraHashesByInst = {};
+        const seenHash = new Set();
+
+        for (const t of relocatePlan.inspectedTorrents) {
+          const hk = `${t.instance_id}::${String(t.torrent_hash || "").toLowerCase()}`;
+          if (seenHash.has(hk)) continue;
+
+          const fileMappings = [];
+          let movedFileCount = 0;
+          for (const tf of t.files || []) {
+            let newLocal = "";
+            const inoKey = tf.inode_str ? `${tf.device || 0}:${tf.inode_str}` : "";
+            if (inoKey && newPathByInode.has(inoKey)) {
+              newLocal = newPathByInode.get(inoKey);
+            } else if (tf.local_path && newPathByOldPath.has(String(tf.local_path).toLowerCase())) {
+              newLocal = newPathByOldPath.get(String(tf.local_path).toLowerCase());
+            }
+
+            if (newLocal && (!tf.local_path || newLocal.toLowerCase() !== String(tf.local_path).toLowerCase())) {
+              movedFileCount++;
+            }
+            fileMappings.push({
+              old_rel_path: tf.rel_path,
+              old_local_path: tf.local_path || "",
+              new_local_path: newLocal,
+              kind: tf.kind || tf.raw_kind || "",
+              device: tf.device || 0,
+              inode_str: tf.inode_str || "",
+              size: tf.size || 0,
+            });
+          }
+
+          if (movedFileCount === 0) continue;
+          seenHash.add(hk);
+          relocateItems.push({
+            instance_id: t.instance_id,
+            torrent_hash: t.torrent_hash,
+            file_mappings: fileMappings,
+            move_companions: relocatePlan.moveCompanions,
+            move_samples: relocatePlan.moveSamples,
+          });
+          if (!extraHashesByInst[t.instance_id]) extraHashesByInst[t.instance_id] = [];
+          extraHashesByInst[t.instance_id].push(t.torrent_hash);
         }
 
         if (relocateItems.length > 0) {
@@ -997,10 +1639,26 @@
           });
           if (epoch !== state.scanEpoch) return;
           await refreshGroupsInPlace(uniqueIds, [], true, extraHashesByInst);
-          const relErrs = (relRes.errors || []).length;
+          const relErrs = relRes.errors || [];
+          const renamedTotal = (relRes.results || []).reduce(
+            (acc, r) => acc + (r.renamed_count != null ? r.renamed_count : r.renamed ? 1 : 0),
+            0
+          );
+          const companionMoved = (relRes.results || []).reduce(
+            (acc, r) => acc + ((r.moved_companions && r.moved_companions.length) || 0),
+            0
+          );
+          const extraParts = [];
+          if (renamedTotal > 0) extraParts.push(`${renamedTotal} file path(s) updated`);
+          if (companionMoved > 0) extraParts.push(`${companionMoved} .nfo/.srt moved`);
+          const extraStr = extraParts.length > 0 ? ` (${extraParts.join(", ")})` : "";
+          const errStr =
+            relErrs.length > 0
+              ? ` • ${relErrs.length} error/skipped${relErrs[0] && relErrs[0].error ? `: ${relErrs[0].error}` : ""}`
+              : "";
           showToast(
-            `Arr sync done & relocated ${relRes.relocated_count} single-file torrent(s) in qBittorrent${relErrs > 0 ? ` (${relErrs} error/skipped)` : ""}.`,
-            relErrs > 0 && relRes.relocated_count === 0 ? "error" : "success"
+            `Arr sync done & relocated ${relRes.relocated_count} torrent(s) in qBittorrent${extraStr}${errStr}.`,
+            relErrs.length > 0 && relRes.relocated_count === 0 ? "error" : "success"
           );
           return;
         }
@@ -1165,7 +1823,7 @@
     return {};
   }
 
-  function renderActionExplanation(type, groups, payload, options = {}) {
+  function renderActionExplanation(type, groups, payload, options = {}, inspectResult = null) {
     const explainEl = $("actionExplainBox");
     const warnEl = $("actionContextWarnings");
     if (!explainEl || !warnEl) return;
@@ -1303,9 +1961,11 @@
         const hitsPrimarySource = (payload.importItems || []).some((it) =>
           primaryPaths.has(String(it.local_path || "").toLowerCase())
         );
-        const relocateInfo = buildQbitRelocatePreview(groups);
+        const relocateInfo = buildQbitRelocatePreview(groups, inspectResult);
         const relocateRow = $("qbitRelocateOptionRow");
         const relocateCheck = $("relocateQbitAfterMoveCheckbox");
+        const moveCompanions = $("moveCompanionFilesCheckbox") ? $("moveCompanionFilesCheckbox").checked : true;
+        const moveSamples = $("moveSampleFilesCheckbox") ? $("moveSampleFilesCheckbox").checked : false;
         const relocateActive =
           payload.import_mode === "move" &&
           relocateRow &&
@@ -1315,13 +1975,52 @@
           relocateInfo.eligible.length > 0;
 
         if (payload.import_mode === "move" && relocateActive) {
+          const singleCnt = relocateInfo.eligible.filter((t) => t.file_count === 1).length;
+          const packCnt = relocateInfo.eligible.length - singleCnt;
+          const kindDesc = packCnt > 0 && singleCnt > 0
+            ? `${packCnt} pack(s) and ${singleCnt} single-file torrent(s)`
+            : packCnt > 0
+              ? `${packCnt} multi-file torrent pack(s)`
+              : `${singleCnt} single-file torrent(s)`;
           bullets.push(
-            `After Arr finishes moving, SeedLink will stop, disable Auto TMM, update location / filename, recheck, and resume ${relocateInfo.eligible.length} eligible single-file torrent(s) in qBittorrent.`
+            `After Arr finishes moving, SeedLink will stop, disable Auto TMM, update location & per-file names, recheck, and resume ${kindDesc} in qBittorrent.`
           );
-          if (relocateInfo.skippedMulti.length > 0) {
-            warnings.push(
-              `Warning: ${relocateInfo.skippedMulti.length} matched torrent(s) contain multiple files (or file count unavailable) and will NOT be auto-relocated in qBittorrent — moving their files may break seeding on those torrents.`
-            );
+
+          const totalCompanions = relocateInfo.eligible.reduce((acc, t) => acc + (t.companion_count || 0), 0);
+          if (totalCompanions > 0) {
+            if (moveCompanions) {
+              bullets.push(
+                `${totalCompanions} companion file(s) (.nfo, .srt, etc.) will also be relocated alongside the pack (if left behind by Arr) so qBittorrent keeps 100% seeding.`
+              );
+            } else {
+              warnings.push(
+                `Warning: ${totalCompanions} companion file(s) (.nfo, .srt) will NOT be moved automatically. If they sit in a different folder than the moved videos, pack relocation will be blocked to avoid partial/99% seeding.`
+              );
+            }
+          }
+          const totalSamples = relocateInfo.eligible.reduce((acc, t) => acc + (t.sample_count || 0), 0);
+          if (totalSamples > 0) {
+            if (moveSamples) {
+              warnings.push(
+                `Note: ${totalSamples} Sample/Extra file(s) are included and will move into your target library folder.`
+              );
+            } else {
+              warnings.push(
+                `Warning: ${totalSamples} Sample/Extra file(s) detected and excluded by default. If they live in Downloads while videos move to Plex, qBittorrent auto-relocate will skip unless you enable moving them or switch to Copy / Hardlink.`
+              );
+            }
+          }
+          if (relocateInfo.blocked.length > 0) {
+            const partialCnt = relocateInfo.blocked.filter((t) => t.status === "partial_pack").length;
+            if (partialCnt > 0) {
+              warnings.push(
+                `Warning: ${partialCnt} torrent(s) are partial packs (unselected video episodes remain) and will NOT be auto-relocated in qBittorrent.`
+              );
+            } else {
+              warnings.push(
+                `Warning: ${relocateInfo.blocked.length} matched torrent(s) cannot be auto-relocated and will be skipped.`
+              );
+            }
           }
         } else if (payload.import_mode !== "copy" && hasTorrents) {
           warnings.push(
@@ -1362,38 +2061,104 @@
     }
   }
 
-  function updateQbitRelocateOptionUi(type, groups, payload) {
+  function updateQbitRelocateOptionUi(type, groups, payload, inspectResult = null) {
     const row = $("qbitRelocateOptionRow");
     const chk = $("relocateQbitAfterMoveCheckbox");
     const hint = $("qbitRelocateSummary");
+    const compRow = $("qbitCompanionOptionRow");
+    const compLbl = $("moveCompanionFilesLabel");
+    const sampleRow = $("qbitSampleOptionRow");
+    const sampleLbl = $("moveSampleFilesLabel");
     if (!row || !chk || !hint) return;
 
     const isArrImport = (type === "arr-import" || type === "arr-fix") && payload.importItems && payload.importItems.length > 0;
-    const relocateInfo = buildQbitRelocatePreview(groups);
-    const hasAnyTorrents = relocateInfo.eligible.length + relocateInfo.skippedMulti.length > 0;
+    const relocateInfo = buildQbitRelocatePreview(groups, inspectResult);
+    const hasAnyTorrents = relocateInfo.eligible.length + relocateInfo.blocked.length > 0;
 
-    if (!isArrImport || payload.import_mode !== "move" || !hasAnyTorrents) {
+    if (!isArrImport || payload.import_mode !== "move" || (!hasAnyTorrents && relocateInfo.errors.length === 0)) {
       row.hidden = true;
+      if (compRow) compRow.hidden = true;
+      if (sampleRow) sampleRow.hidden = true;
       return;
     }
 
     row.hidden = false;
     if (relocateInfo.eligible.length === 0) {
+      chk.dataset.wasDisabled = "true";
       chk.checked = false;
       chk.disabled = true;
-      hint.textContent = `${relocateInfo.skippedMulti.length} matched torrent(s) contain multiple files (e.g. season pack or sample/nfo); auto-relocate only supports single-file torrents.`;
-    } else {
-      chk.disabled = false;
-      const parts = [`${relocateInfo.eligible.length} eligible single-file torrent(s) will be relocated & rechecked`];
-      if (relocateInfo.skippedMulti.length > 0) {
-        parts.push(`${relocateInfo.skippedMulti.length} multi-file torrent(s) will be skipped`);
+      if (compRow) compRow.hidden = true;
+      if (sampleRow) sampleRow.hidden = true;
+
+      if (relocateInfo.blocked.length > 0) {
+        const firstWarn = relocateInfo.blocked.find((b) => b.warnings && b.warnings.length > 0);
+        hint.textContent = firstWarn
+          ? firstWarn.warnings[0]
+          : `${relocateInfo.blocked.length} matched torrent(s) cannot be auto-relocated.`;
+      } else if (relocateInfo.errors.length > 0) {
+        hint.textContent = `Could not inspect torrent(s): ${relocateInfo.errors[0].error || "unknown error"}`;
+      } else {
+        hint.textContent = "No eligible torrents found to relocate.";
       }
-      hint.textContent = parts.join("; ") + ".";
+      return;
+    }
+
+    if (chk.dataset.wasDisabled === "true") {
+      chk.checked = true;
+      chk.dataset.wasDisabled = "false";
+    }
+    chk.disabled = false;
+
+    const singleCnt = relocateInfo.eligible.filter((t) => t.file_count === 1).length;
+    const packCnt = relocateInfo.eligible.length - singleCnt;
+    const readyParts = [];
+    if (singleCnt > 0) readyParts.push(`${singleCnt} single-file`);
+    if (packCnt > 0) readyParts.push(`${packCnt} multi-file pack`);
+    const parts = [`${relocateInfo.eligible.length} torrent(s) ready to relocate & recheck (${readyParts.join(", ")})`];
+    if (relocateInfo.blocked.length > 0) {
+      parts.push(`${relocateInfo.blocked.length} blocked/skipped`);
+    }
+    hint.textContent = parts.join("; ") + ".";
+
+    const companionNames = [];
+    let companionCount = 0;
+    const sampleNames = [];
+    let sampleCount = 0;
+    for (const t of relocateInfo.eligible) {
+      for (const f of t.files || []) {
+        if (f.kind === "metadata" || f.kind === "subtitle") {
+          companionCount++;
+          if (companionNames.length < 4) companionNames.push(f.filename);
+        } else if (f.kind === "sample") {
+          sampleCount++;
+          if (sampleNames.length < 3) sampleNames.push(f.rel_path);
+        }
+      }
+    }
+
+    if (compRow && compLbl) {
+      if (companionCount > 0 && chk.checked) {
+        compRow.hidden = false;
+        const more = companionCount > companionNames.length ? ` (+${companionCount - companionNames.length} more)` : "";
+        compLbl.textContent = `Also move ${companionCount} companion file(s) (${companionNames.join(", ")}${more}) with the pack so qBittorrent stays 100%`;
+      } else {
+        compRow.hidden = true;
+      }
+    }
+    if (sampleRow && sampleLbl) {
+      if (sampleCount > 0 && chk.checked) {
+        sampleRow.hidden = false;
+        const more = sampleCount > sampleNames.length ? ` (+${sampleCount - sampleNames.length} more)` : "";
+        sampleLbl.textContent = `Also move ${sampleCount} Sample / Extra file(s) (${sampleNames.join(", ")}${more}) — warning: may show up in Plex library`;
+      } else {
+        sampleRow.hidden = true;
+      }
     }
   }
 
   async function openActionModal(actionType, groups, options = {}) {
-    state.pendingAction = { type: actionType, groups, options };
+    state.pendingAction = { type: actionType, baseGroups: groups, groups, options };
+    state.lastInspectResult = null;
     const titles = {
       "convert-hardlinks": "Convert Duplicate Copies to Hardlinks",
       "delete-torrents": options.erroredOnly ? "Delete Errored Torrents from qBittorrent" : "Delete Torrents from qBittorrent",
@@ -1405,8 +2170,16 @@
     $("actionModalTitle").textContent = `${titles[actionType]} — Dry-Run Preview`;
     $("torrentDeleteOptionRow").hidden = actionType !== "delete-torrents";
     $("forceManualImportCheckbox").checked = false;
+    if ($("includePackSiblingsCheckbox")) $("includePackSiblingsCheckbox").checked = true;
+    if ($("packSiblingsOptionRow")) $("packSiblingsOptionRow").hidden = true;
     $("relocateQbitAfterMoveCheckbox").checked = true;
     $("relocateQbitAfterMoveCheckbox").disabled = false;
+    $("relocateQbitAfterMoveCheckbox").dataset.wasDisabled = "false";
+    if ($("moveCompanionFilesCheckbox")) $("moveCompanionFilesCheckbox").checked = true;
+    if ($("moveSampleFilesCheckbox")) $("moveSampleFilesCheckbox").checked = false;
+    if ($("qbitCompanionOptionRow")) $("qbitCompanionOptionRow").hidden = true;
+    if ($("qbitSampleOptionRow")) $("qbitSampleOptionRow").hidden = true;
+
     const arrPayload = (actionType === "arr-import" || actionType === "arr-fix")
       ? buildActionPayloadForGroups(actionType, groups)
       : null;
@@ -1426,10 +2199,16 @@
 
   async function refreshActionDryRun() {
     if (!state.pendingAction) return;
-    const { type, groups, options } = state.pendingAction;
+    const previewEpoch = ++state.actionPreviewEpoch;
+    const { type, options } = state.pendingAction;
+    const baseGroups = state.pendingAction.baseGroups || state.pendingAction.groups || [];
+    const currentMode = ($("arrImportModeSelect") && $("arrImportModeSelect").value) || "auto";
+
+    updatePackSiblingsOptionUi(type, baseGroups, currentMode);
+    const groups = getEffectiveActionGroups(state.pendingAction);
+    state.pendingAction.groups = groups;
+
     const payload = buildActionPayloadForGroups(type, groups);
-    updateQbitRelocateOptionUi(type, groups, payload);
-    renderActionExplanation(type, groups, payload, options || {});
     const ro = state.config.read_only_mode;
 
     $("actionReadOnlyBanner").hidden = !ro;
@@ -1438,6 +2217,40 @@
     $("actionPreviewSummary").textContent = "Running dry-run validation...";
     $("actionPreviewList").innerHTML = "";
 
+    let inspectResult = null;
+    if (
+      (type === "arr-import" || type === "arr-fix") &&
+      payload.importItems &&
+      payload.importItems.length > 0 &&
+      payload.import_mode === "move"
+    ) {
+      const inspectReq = collectInspectInput(groups, payload.importItems);
+      if (inspectReq.torrents.length > 0) {
+        try {
+          inspectResult = await apiFetch("/api/actions/qbit-relocate/inspect", {
+            method: "POST",
+            body: JSON.stringify(inspectReq),
+          });
+          if (previewEpoch !== state.actionPreviewEpoch) return;
+          state.lastInspectResult = inspectResult;
+        } catch (err) {
+          if (previewEpoch !== state.actionPreviewEpoch) return;
+          state.lastInspectResult = null;
+          inspectResult = {
+            torrents: [],
+            errors: [{ instance_id: "", torrent_hash: "", error: err.message }],
+          };
+        }
+      } else {
+        state.lastInspectResult = null;
+      }
+    } else {
+      state.lastInspectResult = null;
+    }
+
+    updateQbitRelocateOptionUi(type, groups, payload, inspectResult);
+    renderActionExplanation(type, groups, payload, options || {}, inspectResult);
+
     try {
       let result;
       if (type === "convert-hardlinks") {
@@ -1445,6 +2258,7 @@
           method: "POST",
           body: JSON.stringify({ pairs: payload.pairs, dry_run: true }),
         });
+        if (previewEpoch !== state.actionPreviewEpoch) return;
         $("actionPreviewSummary").innerHTML =
           `<strong>${result.converted_count}</strong> copy pair(s) verified identical (SHA-256 head/mid/tail) and ready to hardlink. Disk space reclaimed: <strong>${formatBytes(result.bytes_reclaimed)}</strong>.`;
         $("actionPreviewList").innerHTML = [
@@ -1464,6 +2278,7 @@
           method: "POST",
           body: JSON.stringify({ items: payload.items, delete_files: payload.delete_files, dry_run: true }),
         });
+        if (previewEpoch !== state.actionPreviewEpoch) return;
         $("actionPreviewSummary").innerHTML =
           `<strong>${result.deleted_count}</strong> torrent(s) queued for removal${payload.delete_files ? " <strong>with data files</strong>" : " (keeping files on disk)"}. Estimated disk space freed: <strong>${formatBytes(result.bytes_reclaimed)}</strong>.`;
         $("actionPreviewList").innerHTML = [
@@ -1481,6 +2296,7 @@
           method: "POST",
           body: JSON.stringify({ file_paths: payload.file_paths, cleanup_empty_dirs: true, dry_run: true }),
         });
+        if (previewEpoch !== state.actionPreviewEpoch) return;
         $("actionPreviewSummary").innerHTML =
           `<strong>${result.deleted_count}</strong> file(s) will be deleted from disk. Estimated physical space freed: <strong>${formatBytes(result.bytes_reclaimed)}</strong>.`;
         $("actionPreviewList").innerHTML = [
@@ -1506,6 +2322,7 @@
               dry_run: true,
             }),
           });
+          if (previewEpoch !== state.actionPreviewEpoch) return;
           totalTriggered += impRes.triggered_count;
           summaryParts.push(`<strong>${impRes.triggered_count}</strong> import scan(s)`);
           for (const r of impRes.results) {
@@ -1533,6 +2350,7 @@
             method: "POST",
             body: JSON.stringify({ items: payload.rescanItems, dry_run: true }),
           });
+          if (previewEpoch !== state.actionPreviewEpoch) return;
           totalTriggered += resRes.triggered_count;
           summaryParts.push(`<strong>${resRes.triggered_count}</strong> library rescan(s)`);
           for (const r of resRes.results) {
@@ -1547,6 +2365,8 @@
 
         const relocateRow = $("qbitRelocateOptionRow");
         const relocateCheck = $("relocateQbitAfterMoveCheckbox");
+        const moveCompanions = $("moveCompanionFilesCheckbox") ? $("moveCompanionFilesCheckbox").checked : true;
+        const moveSamples = $("moveSampleFilesCheckbox") ? $("moveSampleFilesCheckbox").checked : false;
         if (
           payload.import_mode === "move" &&
           relocateRow &&
@@ -1554,18 +2374,39 @@
           relocateCheck &&
           relocateCheck.checked
         ) {
-          const relocateInfo = buildQbitRelocatePreview(groups);
-          for (const item of relocateInfo.eligible) {
-            const t = item.torrent;
+          const relocateInfo = buildQbitRelocatePreview(groups, inspectResult);
+          for (const t of relocateInfo.eligible) {
+            const compFiles = (t.files || []).filter((f) => f.kind === "metadata" || f.kind === "subtitle");
+            const sampleFiles = (t.files || []).filter((f) => f.kind === "sample");
+            const detailParts = [`${t.selected_count || t.file_count} of ${t.file_count} file(s)`];
+            if (compFiles.length > 0) {
+              detailParts.push(
+                moveCompanions
+                  ? `+ ${compFiles.length} companion(s) (.nfo/.srt)`
+                  : `WARNING: ${compFiles.length} companion(s) NOT moved`
+              );
+            }
+            if (sampleFiles.length > 0) {
+              detailParts.push(
+                moveSamples
+                  ? `+ ${sampleFiles.length} sample(s) included`
+                  : `${sampleFiles.length} sample(s) excluded`
+              );
+            }
+            const warnCls = (compFiles.length > 0 && !moveCompanions) || sampleFiles.length > 0 ? "preview-warn" : "";
             rowsHtml.push(
-              `<div class="preview-row">QBIT RELOCATE: [${escapeHtml(t.instance_name)}] ${escapeHtml(t.torrent_name)} (1 file) &mdash; will update location/name &amp; recheck after Arr finishes</div>`
+              `<div class="preview-row ${warnCls}">QBIT RELOCATE: [${escapeHtml(t.instance_name)}] ${escapeHtml(t.torrent_name)} (${escapeHtml(detailParts.join(" • "))}) &mdash; will update save path/names &amp; recheck after Arr finishes</div>`
             );
           }
-          for (const item of relocateInfo.skippedMulti) {
-            const t = item.torrent;
-            const fc = t.torrent_file_count > 0 ? `${t.torrent_file_count} files` : "multi-file";
+          for (const t of relocateInfo.blocked) {
+            const msg = (t.warnings && t.warnings[0]) || "Cannot auto-relocate";
             rowsHtml.push(
-              `<div class="preview-row preview-err">QBIT SKIP (${escapeHtml(fc)}): [${escapeHtml(t.instance_name)}] ${escapeHtml(t.torrent_name)}</div>`
+              `<div class="preview-row preview-err">QBIT SKIP (${escapeHtml(t.status || "blocked")}): [${escapeHtml(t.instance_name)}] ${escapeHtml(t.torrent_name)} &mdash; ${escapeHtml(msg)}</div>`
+            );
+          }
+          for (const e of relocateInfo.errors) {
+            rowsHtml.push(
+              `<div class="preview-row preview-err">QBIT INSPECT ERROR: ${escapeHtml(e.torrent_hash || "")} &mdash; ${escapeHtml(e.error)}</div>`
             );
           }
         }
@@ -1580,6 +2421,7 @@
         }
       }
     } catch (err) {
+      if (previewEpoch !== state.actionPreviewEpoch) return;
       $("actionPreviewSummary").textContent = `Preview failed: ${err.message}`;
       $("confirmActionBtn").disabled = true;
     }
@@ -1587,7 +2429,8 @@
 
   async function executePendingAction(unlockFirst = false) {
     if (!state.pendingAction) return;
-    const { type, groups } = state.pendingAction;
+    const { type } = state.pendingAction;
+    const groups = getEffectiveActionGroups(state.pendingAction);
 
     try {
       if (unlockFirst && state.config.read_only_mode) {
@@ -1611,19 +2454,42 @@
         !$("qbitRelocateOptionRow").hidden &&
         $("relocateQbitAfterMoveCheckbox") &&
         $("relocateQbitAfterMoveCheckbox").checked &&
-        !$("relocateQbitAfterMoveCheckbox").disabled
+        !$("relocateQbitAfterMoveCheckbox").disabled &&
+        state.lastInspectResult
       ) {
-        relocatePlan = new Map();
-        for (const g of groups || []) {
-          const singleFileTorrents = (g.torrents || []).filter((t) => (t.torrent_file_count || 0) === 1);
-          if (singleFileTorrents.length === 0) continue;
-          relocatePlan.set(g.id, {
-            oldPaths: new Set((g.all_paths || []).map((p) => String(p).toLowerCase())),
-            torrents: singleFileTorrents.map((t) => ({
-              instance_id: t.instance_id,
-              torrent_hash: t.torrent_hash,
-            })),
-          });
+        const relocatableTorrents = (state.lastInspectResult.torrents || []).filter((t) => t.can_relocate);
+        if (relocatableTorrents.length > 0) {
+          const groupPreMoveMap = new Map();
+          for (const g of groups || []) {
+            const oldPaths = new Set((g.all_paths || []).map((p) => String(p).toLowerCase()));
+            for (const m of g.arr_matches || []) {
+              if (m.file_path) oldPaths.add(String(m.file_path).toLowerCase());
+            }
+            const inodeKeys = new Set();
+            for (const f of [...(g.folder_a_files || []), ...(g.folder_b_files || [])]) {
+              const ino = f.inode_str || (f.inode ? String(f.inode) : "");
+              if (ino && ino !== "0") {
+                inodeKeys.add(`${f.device || 0}:${ino}`);
+              }
+            }
+            groupPreMoveMap.set(g.id, { oldPaths, inodeKeys });
+          }
+
+          relocatePlan = {
+            moveCompanions: $("moveCompanionFilesCheckbox") ? $("moveCompanionFilesCheckbox").checked : true,
+            moveSamples: $("moveSampleFilesCheckbox") ? $("moveSampleFilesCheckbox").checked : false,
+            inspectedTorrents: relocatableTorrents,
+            groupPreMoveMap,
+          };
+
+          const relHashSet = new Set(relocatableTorrents.map((t) => `${t.instance_id}::${String(t.torrent_hash).toLowerCase()}`));
+          if (state.scan && Array.isArray(state.scan.groups)) {
+            for (const g of state.scan.groups) {
+              if ((g.torrents || []).some((t) => relHashSet.has(`${t.instance_id}::${String(t.torrent_hash).toLowerCase()}`))) {
+                if (!affectedIds.includes(g.id)) affectedIds.push(g.id);
+              }
+            }
+          }
         }
       }
 
@@ -2057,12 +2923,22 @@
   }
 
   function getCurrentPageSlice() {
-    const filtered = getFilteredGroups();
-    const totalPages = Math.max(1, Math.ceil(filtered.length / state.pageSize));
+    const filteredGroups = getFilteredGroups();
+    const displayRows = buildPackDisplayRows(filteredGroups);
+    const totalPages = Math.max(1, Math.ceil(displayRows.length / state.pageSize));
     const page = Math.min(Math.max(1, state.page), totalPages);
     const startIdx = (page - 1) * state.pageSize;
-    const pageRows = filtered.slice(startIdx, startIdx + state.pageSize);
-    return { filtered, pageRows, totalPages, page };
+    const pageItems = displayRows.slice(startIdx, startIdx + state.pageSize);
+    return { filteredGroups, displayRows, pageItems, totalPages, page };
+  }
+
+  function syncViewModeUi() {
+    if ($("viewModeGroupedBtn")) {
+      $("viewModeGroupedBtn").classList.toggle("active", state.viewMode === "grouped");
+    }
+    if ($("viewModeFlatBtn")) {
+      $("viewModeFlatBtn").classList.toggle("active", state.viewMode !== "grouped");
+    }
   }
 
   // --- Event Binding ---
@@ -2150,23 +3026,49 @@
       renderTable();
     });
 
+    $("viewModeGroupedBtn").addEventListener("click", () => {
+      if (state.viewMode !== "grouped") {
+        state.viewMode = "grouped";
+        state.page = 1;
+        syncViewModeUi();
+        renderTable();
+      }
+    });
+    $("viewModeFlatBtn").addEventListener("click", () => {
+      if (state.viewMode !== "flat") {
+        state.viewMode = "flat";
+        state.page = 1;
+        syncViewModeUi();
+        renderTable();
+      }
+    });
+
     $("expandPageBtn").addEventListener("click", () => {
-      const { pageRows } = getCurrentPageSlice();
-      if (pageRows.length === 0) return;
-      const allExpanded = pageRows.every((g) => state.expandedGroupIds.has(g.id));
-      for (const g of pageRows) {
-        if (allExpanded) state.expandedGroupIds.delete(g.id);
-        else state.expandedGroupIds.add(g.id);
+      const { pageItems } = getCurrentPageSlice();
+      if (pageItems.length === 0) return;
+      const isExpanded = (it) =>
+        it.kind === "pack" ? state.expandedPackIds.has(it.id) : state.expandedGroupIds.has(it.id);
+      const allExpanded = pageItems.every(isExpanded);
+      for (const it of pageItems) {
+        if (it.kind === "pack") {
+          if (allExpanded) state.expandedPackIds.delete(it.id);
+          else state.expandedPackIds.add(it.id);
+        } else {
+          if (allExpanded) state.expandedGroupIds.delete(it.id);
+          else state.expandedGroupIds.add(it.id);
+        }
       }
       renderTable();
     });
 
     $("selectAllCheckbox").addEventListener("change", (e) => {
-      const { pageRows } = getCurrentPageSlice();
-      if (e.target.checked) {
-        pageRows.forEach((g) => state.selectedGroupIds.add(g.id));
-      } else {
-        pageRows.forEach((g) => state.selectedGroupIds.delete(g.id));
+      const { pageItems } = getCurrentPageSlice();
+      for (const it of pageItems) {
+        for (const m of it.members || [it.group]) {
+          if (!m || !m.id) continue;
+          if (e.target.checked) state.selectedGroupIds.add(m.id);
+          else state.selectedGroupIds.delete(m.id);
+        }
       }
       renderTable();
     });
@@ -2182,18 +3084,76 @@
 
     $("auditTableBody").addEventListener("click", async (e) => {
       const target = e.target;
+      if (target.classList.contains("pack-checkbox")) {
+        const packId = target.dataset.packId;
+        const pack = state.currentPackMap.get(packId);
+        if (pack) {
+          for (const m of pack.members) {
+            if (target.checked) state.selectedGroupIds.add(m.id);
+            else state.selectedGroupIds.delete(m.id);
+          }
+          renderTable();
+        }
+        return;
+      }
+
       if (target.classList.contains("row-checkbox")) {
         const gid = target.dataset.groupId;
         if (target.checked) state.selectedGroupIds.add(gid);
         else state.selectedGroupIds.delete(gid);
-        const { filtered, pageRows } = getCurrentPageSlice();
-        updateSelectionControls(filtered, pageRows);
+        renderTable();
         return;
       }
 
       const btn = target.closest("button");
       if (btn) {
         if (!state.scan) return;
+        if (btn.dataset.packId) {
+          const packId = btn.dataset.packId;
+          if (btn.classList.contains("pack-expand-btn")) {
+            if (state.expandedPackIds.has(packId)) state.expandedPackIds.delete(packId);
+            else state.expandedPackIds.add(packId);
+            renderTable();
+            return;
+          }
+          const pack = state.currentPackMap.get(packId);
+          if (!pack) return;
+
+          if (btn.classList.contains("pack-arr-import")) {
+            openActionModal("arr-import", pack.members);
+          } else if (btn.classList.contains("pack-arr-rescan")) {
+            openActionModal("arr-rescan", pack.members);
+          } else if (btn.classList.contains("pack-delete-errored-torrent")) {
+            const erroredGroups = pack.members
+              .map((m) => ({ ...m, torrents: (m.torrents || []).filter((t) => Boolean(t.tracker_health)) }))
+              .filter((m) => m.torrents.length > 0);
+            openActionModal("delete-torrents", erroredGroups, { erroredOnly: true });
+          } else if (btn.classList.contains("pack-delete-torrent")) {
+            openActionModal("delete-torrents", pack.members);
+          } else if (btn.classList.contains("pack-hardlink")) {
+            openActionModal("convert-hardlinks", pack.members);
+          } else if (btn.classList.contains("pack-delete-file")) {
+            openActionModal("delete-files", pack.members);
+          } else if (btn.classList.contains("pack-refresh")) {
+            btn.disabled = true;
+            btn.textContent = "...";
+            try {
+              const ids = pack.members.map((m) => m.id);
+              const refRes = await refreshGroupsInPlace(ids, [], true);
+              if (refRes) {
+                showToast(`Refreshed ${ids.length} pack file(s) in ${refRes.duration_ms} ms.`, "success");
+              }
+            } catch (err) {
+              showToast(`Pack refresh failed: ${err.message}`, "error");
+              if (btn.isConnected) {
+                btn.disabled = false;
+                btn.innerHTML = "&#8635;";
+              }
+            }
+          }
+          return;
+        }
+
         const gid = btn.dataset.groupId;
         if (btn.classList.contains("row-expand-btn")) {
           if (state.expandedGroupIds.has(gid)) state.expandedGroupIds.delete(gid);
@@ -2242,6 +3202,14 @@
       }
 
       if (target.closest("input, a, select, label")) return;
+      const packRow = target.closest("tr.pack-row");
+      if (packRow && packRow.dataset.packId) {
+        const packId = packRow.dataset.packId;
+        if (state.expandedPackIds.has(packId)) state.expandedPackIds.delete(packId);
+        else state.expandedPackIds.add(packId);
+        renderTable();
+        return;
+      }
       const mainRow = target.closest("tr.main-row");
       if (!mainRow || mainRow.closest(".detail-row")) return;
       const gid = mainRow.dataset.groupId;
@@ -2268,7 +3236,10 @@
     $("cancelActionBtn").addEventListener("click", () => ($("actionModal").hidden = true));
     $("deleteTorrentFilesCheckbox").addEventListener("change", refreshActionDryRun);
     $("arrImportModeSelect").addEventListener("change", refreshActionDryRun);
+    $("includePackSiblingsCheckbox").addEventListener("change", refreshActionDryRun);
     $("relocateQbitAfterMoveCheckbox").addEventListener("change", refreshActionDryRun);
+    $("moveCompanionFilesCheckbox").addEventListener("change", refreshActionDryRun);
+    $("moveSampleFilesCheckbox").addEventListener("change", refreshActionDryRun);
     $("forceManualImportCheckbox").addEventListener("change", refreshActionDryRun);
     $("confirmActionBtn").addEventListener("click", () => executePendingAction(false));
     $("unlockAndExecuteBtn").addEventListener("click", () => executePendingAction(true));

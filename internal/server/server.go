@@ -67,6 +67,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/actions/delete-files", s.handleDeleteFiles)
 	s.mux.HandleFunc("POST /api/actions/arr-import", s.handleArrImport)
 	s.mux.HandleFunc("POST /api/actions/arr-rescan", s.handleArrRescan)
+	s.mux.HandleFunc("POST /api/actions/qbit-relocate/inspect", s.handleQbitRelocateInspect)
 	s.mux.HandleFunc("POST /api/actions/qbit-relocate", s.handleQbitRelocate)
 	s.mux.HandleFunc("POST /api/arr/commands/status", s.handleArrCommandsStatus)
 	s.mux.HandleFunc("GET /api/export", s.handleExport)
@@ -726,6 +727,24 @@ func (s *Server) handleArrRescan(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, err.Error())
 			return
 		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleQbitRelocateInspect(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		Torrents           []actions.QbitInspectTorrentRef `json:"torrents"`
+		SelectedLocalPaths []string                        `json:"selected_local_paths"`
+	}
+	if err := decodeJSONBody(w, r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON payload: %v", err))
+		return
+	}
+
+	res, err := actions.InspectQbitRelocateAction(r.Context(), s.cfgMgr.Get(), s.qbitClient, payload.Torrents, payload.SelectedLocalPaths)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
