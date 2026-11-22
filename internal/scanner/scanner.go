@@ -76,25 +76,27 @@ type TorrentMatch struct {
 }
 
 type ArrReference struct {
-	InstanceID       string `json:"instance_id"`
-	InstanceName     string `json:"instance_name"`
-	AppType          string `json:"app_type"`
-	ItemID           int    `json:"item_id"`
-	EpisodeIDs       []int  `json:"episode_ids,omitempty"`
-	Title            string `json:"title"`
-	Year             int    `json:"year,omitempty"`
-	SeasonNumber     int    `json:"season_number,omitempty"`
-	EpisodeNumber    int    `json:"episode_number,omitempty"`
-	Monitored        bool   `json:"monitored"`
-	HasFile          bool   `json:"has_file"`
-	MatchKind        string `json:"match_kind"`
-	StatusMessage    string `json:"status_message,omitempty"`
-	FilePath         string `json:"file_path,omitempty"`
-	RootPath         string `json:"root_path,omitempty"`
-	ExistingFileName string `json:"existing_file_name,omitempty"`
-	ExistingFilePath string `json:"existing_file_path,omitempty"`
-	CanImport        bool   `json:"can_import"`
-	CanRescan        bool   `json:"can_rescan"`
+	InstanceID       string   `json:"instance_id"`
+	InstanceName     string   `json:"instance_name"`
+	AppType          string   `json:"app_type"`
+	ItemID           int      `json:"item_id"`
+	EpisodeIDs       []int    `json:"episode_ids,omitempty"`
+	Title            string   `json:"title"`
+	Year             int      `json:"year,omitempty"`
+	SeasonNumber     int      `json:"season_number,omitempty"`
+	EpisodeNumber    int      `json:"episode_number,omitempty"`
+	Monitored        bool     `json:"monitored"`
+	HasFile          bool     `json:"has_file"`
+	MatchKind        string   `json:"match_kind"`
+	StatusMessage    string   `json:"status_message,omitempty"`
+	FilePath         string   `json:"file_path,omitempty"`
+	RootPath         string   `json:"root_path,omitempty"`
+	ExistingFileName string   `json:"existing_file_name,omitempty"`
+	ExistingFilePath string   `json:"existing_file_path,omitempty"`
+	Genres           []string `json:"genres,omitempty"`
+	HasPoster        bool     `json:"has_poster,omitempty"`
+	CanImport        bool     `json:"can_import"`
+	CanRescan        bool     `json:"can_rescan"`
 }
 
 type ComparisonGroup struct {
@@ -897,6 +899,8 @@ func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEn
 					MatchKind:     "imported",
 					StatusMessage: "Imported and referenced",
 					FilePath:      fm.Entry.MappedPath,
+					Genres:        fm.Entry.Genres,
+					HasPoster:     fm.Entry.HasPoster,
 				})
 			}
 		}
@@ -929,10 +933,16 @@ func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEn
 				anyQueueBlocked = true
 			}
 			var queueRootPath string
+			var queueGenres []string
+			var queueHasPoster bool
 			if qm.ItemID > 0 {
 				for _, lib := range arrIndex.LibraryRoots {
-					if lib.InstanceID == qm.InstanceID && lib.ItemID == qm.ItemID && lib.MappedPath != "" {
-						queueRootPath = lib.MappedPath
+					if lib.InstanceID == qm.InstanceID && lib.ItemID == qm.ItemID {
+						if lib.MappedPath != "" {
+							queueRootPath = lib.MappedPath
+						}
+						queueGenres = lib.Genres
+						queueHasPoster = lib.HasPoster
 						break
 					}
 				}
@@ -949,6 +959,8 @@ func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEn
 				StatusMessage: msg,
 				FilePath:      importCandidatePath,
 				RootPath:      queueRootPath,
+				Genres:        queueGenres,
+				HasPoster:     queueHasPoster,
 				CanImport:     len(inA) == 0 || qm.IsBlocked,
 			})
 		}
@@ -979,6 +991,8 @@ func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEn
 					StatusMessage: "File sits in library folder but is unlinked in Arr",
 					FilePath:      f.AbsPath,
 					RootPath:      lib.MappedPath,
+					Genres:        lib.Genres,
+					HasPoster:     lib.HasPoster,
 					CanRescan:     true,
 				})
 			}
@@ -1047,6 +1061,8 @@ func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEn
 							RootPath:         tm.RootPath,
 							ExistingFileName: tm.ExistingFileName,
 							ExistingFilePath: tm.ExistingFilePath,
+							Genres:           tm.Genres,
+							HasPoster:        tm.HasPoster,
 							CanImport:        canImport,
 						})
 					}

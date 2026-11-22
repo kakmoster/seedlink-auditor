@@ -958,6 +958,7 @@ type mockArrServer struct {
 	wanted          []map[string]any
 	queue           []map[string]any
 	manualItems     []map[string]any
+	posters         map[int][]byte
 }
 
 func newMockArrServer(t *testing.T, appType string) *mockArrServer {
@@ -966,6 +967,7 @@ func newMockArrServer(t *testing.T, appType string) *mockArrServer {
 		commands:        make([]map[string]any, 0),
 		commandStatuses: make(map[int]string),
 		episodeFiles:    make(map[string][]map[string]any),
+		posters:         make(map[int][]byte),
 	}
 
 	mux := http.NewServeMux()
@@ -1156,6 +1158,26 @@ func newMockArrServer(t *testing.T, appType string) *mockArrServer {
 			"name":   ma.commands[cmdID-1]["name"],
 			"status": status,
 		})
+	})
+
+	mux.HandleFunc("GET /api/v3/mediacover/{id}/{file}", func(w http.ResponseWriter, r *http.Request) {
+		if !requireKey(w, r) {
+			return
+		}
+		idVal, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		ma.mu.Lock()
+		img := ma.posters[idVal]
+		ma.mu.Unlock()
+		if len(img) == 0 {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(img)
 	})
 
 	ma.server = httptest.NewServer(mux)
@@ -2769,3 +2791,344 @@ func TestArrSeriesAndMovieTitleYearDisambiguation(t *testing.T) {
 		t.Fatalf("expected Fast X 2023 to match ONLY ID 202 (not Fast 2023), got %+v", gFastX.ArrMatches)
 	}
 }
+
+func TestArrPostersGenresAndDisplaySetting(t *testing.T) {
+	root := t.TempDir()
+	plexDir := filepath.Join(root, "plex")
+	dlDir := filepath.Join(root, "downloads")
+
+	// Legacy config backward compatibility: missing show_media_metadata defaults to true.
+	legacyCfgPath := filepath.Join(root, "legacy-settings.json")
+	if err := os.WriteFile(legacyCfgPath, []byte(`{"read_only_mode":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	legacyMgr, err := config.NewManager(legacyCfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !legacyMgr.Get().ShowMediaMetadata {
+		t.Fatalf("expected legacy config without show_media_metadata to default to true")
+	}
+
+	// Files covering imported, wanted, queue, library_unlinked, and replaced paths.
+	fIncPlex := filepath.Join(plexDir, "movies", "Inception (2010)", "Inception (2010).mkv")
+	fIncDl := filepath.Join(dlDir, "movies", "Inception.2010.1080p.mkv")
+	writeTestFile(t, fIncPlex, makePayload("inc-meta", 32*1024))
+	if err := os.MkdirAll(filepath.Dir(fIncDl), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(fIncPlex, fIncDl); err != nil {
+		t.Fatal(err)
+	}
+
+	fDune := filepath.Join(dlDir, "movies", "Dune.Part.Two.2024.1080p.mkv")
+	fHeat := filepath.Join(dlDir, "movies", "Heat.1995.BluRay.mkv")
+	fAndorUnlinked := filepath.Join(plexDir, "tv", "Andor", "Season 01", "Andor.S01E01.mkv")
+	fSevReplaced := filepath.Join(dlDir, "tv", "Severance.S01E01.720p.mkv")
+	fSiloWanted := filepath.Join(dlDir, "tv", "Silo.S01E01.1080p.mkv")
+	heatSize := 40 * 1024
+	writeTestFile(t, fDune, makePayload("dune2-meta", 28*1024))
+	writeTestFile(t, fHeat, makePayload("heat-meta", heatSize))
+	writeTestFile(t, fAndorUnlinked, makePayload("andor-meta", 30*1024))
+	writeTestFile(t, fSevReplaced, makePayload("sev-rep-meta", 26*1024))
+	writeTestFile(t, fSiloWanted, makePayload("silo-want-meta", 24*1024))
+
+	radarrPosterPNG := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 'R', 'A', 'D', '1'}
+	heatPosterPNG := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 'H', 'E', 'A', 'T'}
+	sonarrPosterPNG := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 'S', 'O', 'N', '1'}
+	remotePosterPNG := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 'R', 'E', 'M', '2'}
+
+	var remoteMu sync.Mutex
+	remoteSawApiKey := false
+	remotePosterSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Api-Key") != "" {
+			remoteMu.Lock()
+			remoteSawApiKey = true
+			remoteMu.Unlock()
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(remotePosterPNG)
+	}))
+	t.Cleanup(remotePosterSrv.Close)
+
+	mq := newMockQbitServer(t, []mockTorrent{
+		{
+			Hash:     "cccc3333cccc3333cccc3333cccc3333cccc3333",
+			Name:     "Heat.1995.BluRay",
+			SavePath: qbit.NormalizeSlashPath(dlDir),
+			State:    "stalledUP",
+			Ratio:    1.1,
+			Tracker:  "https://tracker.org/announce",
+			Trackers: []mockTracker{{URL: "https://tracker.org/announce", Status: 2}},
+			Files: []struct {
+				Name string `json:"name"`
+				Size int64  `json:"size"`
+			}{{Name: "movies/Heat.1995.BluRay.mkv", Size: int64(heatSize)}},
+		},
+	})
+
+	radarrMock := newMockArrServer(t, "radarr")
+	radarrMock.posters[10] = radarrPosterPNG
+	radarrMock.posters[30] = heatPosterPNG
+	radarrMock.movies = []map[string]any{
+		{
+			"id":        10,
+			"title":     "Inception",
+			"year":      2010,
+			"path":      "/media/movies/Inception (2010)",
+			"hasFile":   true,
+			"monitored": true,
+			"genres":    []string{"Sci-Fi", "Thriller"},
+			"images":    []map[string]any{{"coverType": "poster", "url": "/MediaCover/10/poster.jpg"}},
+			"movieFile": map[string]any{
+				"id":           101,
+				"path":         "/media/movies/Inception (2010)/Inception (2010).mkv",
+				"relativePath": "Inception (2010).mkv",
+				"size":         32 * 1024,
+			},
+		},
+		{
+			"id":        20,
+			"title":     "Dune: Part Two",
+			"year":      2024,
+			"path":      "/media/movies/Dune Part Two (2024)",
+			"hasFile":   false,
+			"monitored": true,
+			"genres":    []string{"Action", "Adventure"},
+			"images":    []map[string]any{{"coverType": "poster", "remoteUrl": remotePosterSrv.URL + "/poster.jpg"}},
+		},
+		{
+			"id":        30,
+			"title":     "Heat",
+			"year":      1995,
+			"path":      "/media/movies/Heat (1995)",
+			"hasFile":   false,
+			"monitored": true,
+			"genres":    []string{"Crime", "Drama"},
+			"images":    []map[string]any{{"coverType": "poster", "url": "/MediaCover/30/poster.jpg"}},
+		},
+	}
+	radarrMock.queue = []map[string]any{
+		{
+			"id":                    901,
+			"movieId":               30,
+			"title":                 "Heat.1995.BluRay",
+			"status":                "completed",
+			"trackedDownloadStatus": "warning",
+			"trackedDownloadState":  "importBlocked",
+			"downloadId":            "CCCC3333CCCC3333CCCC3333CCCC3333CCCC3333",
+			"errorMessage":          "Upgrade blocked",
+		},
+	}
+
+	sonarrMock := newMockArrServer(t, "sonarr")
+	sonarrMock.posters[70] = sonarrPosterPNG
+	sonarrMock.posters[71] = sonarrPosterPNG
+	sonarrMock.posters[72] = sonarrPosterPNG
+	sonarrMock.series = []map[string]any{
+		{
+			"id":        70,
+			"title":     "Severance",
+			"year":      2022,
+			"path":      "/media/tv/Severance",
+			"monitored": true,
+			"genres":    []string{"Drama", "Mystery"},
+			"images":    []map[string]any{{"coverType": "poster", "url": "/MediaCover/70/poster.jpg"}},
+		},
+		{
+			"id":        71,
+			"title":     "Andor",
+			"year":      2022,
+			"path":      "/media/tv/Andor",
+			"monitored": true,
+			"genres":    []string{"Action", "Sci-Fi"},
+			"images":    []map[string]any{{"coverType": "poster", "url": "/MediaCover/71/poster.jpg"}},
+		},
+		{
+			"id":        72,
+			"title":     "Silo",
+			"year":      2023,
+			"path":      "/media/tv/Silo",
+			"monitored": true,
+			"genres":    []string{"Drama", "Sci-Fi"},
+			"images":    []map[string]any{{"coverType": "poster", "url": "/MediaCover/72/poster.jpg"}},
+		},
+	}
+	sonarrMock.episodeFiles["70"] = []map[string]any{
+		{
+			"id":           701,
+			"seriesId":     70,
+			"seasonNumber": 1,
+			"path":         "/media/tv/Severance/Season 01/Severance - S01E01.mkv",
+			"relativePath": "Season 01/Severance - S01E01.mkv",
+			"size":         999999,
+		},
+	}
+	sonarrMock.wanted = []map[string]any{
+		{
+			"id":            7201,
+			"seriesId":      72,
+			"seasonNumber":  1,
+			"episodeNumber": 1,
+			"title":         "Freedom Day",
+			"monitored":     true,
+			"hasFile":       false,
+		},
+	}
+
+	cfgMgr, err := config.NewManager(filepath.Join(root, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfgMgr.Get().ShowMediaMetadata {
+		t.Fatalf("expected fresh config default ShowMediaMetadata=true")
+	}
+
+	ts := httptest.NewServer(server.New(cfgMgr, qbit.NewClient(5*time.Second), arr.NewClient(5*time.Second), nil))
+	t.Cleanup(ts.Close)
+
+	// Verify GET /api/config returns default show_media_metadata=true
+	var gotCfg config.AppSettings
+	if c := apiDoJSON(t, ts, http.MethodGet, "/api/config", nil, &gotCfg); c != http.StatusOK {
+		t.Fatalf("GET /api/config returned %d", c)
+	}
+	if !gotCfg.ShowMediaMetadata {
+		t.Fatalf("expected GET /api/config ShowMediaMetadata=true")
+	}
+
+	// Toggle off via PUT /api/config, verify persistence, then set instances with show_media_metadata=true
+	gotCfg.ShowMediaMetadata = false
+	var savedCfg config.AppSettings
+	if c := apiDoJSON(t, ts, http.MethodPut, "/api/config", gotCfg, &savedCfg); c != http.StatusOK {
+		t.Fatalf("PUT /api/config(false) returned %d", c)
+	}
+	if savedCfg.ShowMediaMetadata {
+		t.Fatalf("expected PUT /api/config to persist ShowMediaMetadata=false")
+	}
+	reloadedMgr, err := config.NewManager(filepath.Join(root, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloadedMgr.Get().ShowMediaMetadata {
+		t.Fatalf("expected reloaded settings.json to keep ShowMediaMetadata=false")
+	}
+
+	updateCfg := config.AppSettings{
+		ReadOnlyMode:      true,
+		ShowMediaMetadata: true,
+		Folders: []config.FolderConfig{
+			{ID: "plex", Label: "Plex", Path: plexDir, Role: "primary"},
+			{ID: "dl", Label: "Downloads", Path: dlDir, Role: "secondary"},
+		},
+		QbitInstances: []config.QbitInstanceConfig{
+			{
+				ID: "qb1", Name: "qBit", URL: mq.server.URL, Username: "admin", Password: "secret", Enabled: true,
+				PathMappings: []config.PathMapping{{RemotePrefix: qbit.NormalizeSlashPath(dlDir), LocalPrefix: qbit.NormalizeSlashPath(dlDir)}},
+			},
+		},
+		ArrInstances: []config.ArrInstanceConfig{
+			{
+				ID: "rad1", Name: "Radarr", Type: "radarr", URL: radarrMock.server.URL, APIKey: "arr-secret-key", Enabled: true,
+				PathMappings: []config.PathMapping{{RemotePrefix: "/media", LocalPrefix: qbit.NormalizeSlashPath(plexDir)}},
+			},
+			{
+				ID: "son1", Name: "Sonarr", Type: "sonarr", URL: sonarrMock.server.URL, APIKey: "arr-secret-key", Enabled: true,
+				PathMappings: []config.PathMapping{{RemotePrefix: "/media", LocalPrefix: qbit.NormalizeSlashPath(plexDir)}},
+			},
+		},
+	}
+	if c := apiDoJSON(t, ts, http.MethodPut, "/api/config", updateCfg, &savedCfg); c != http.StatusOK || !savedCfg.ShowMediaMetadata {
+		t.Fatalf("PUT /api/config(true) failed: code=%d saved=%+v", c, savedCfg)
+	}
+
+	var scanRes scanner.ScanResult
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/scan", nil, &scanRes); c != http.StatusOK {
+		t.Fatalf("POST /api/scan returned %d", c)
+	}
+	byName := make(map[string]scanner.ComparisonGroup, len(scanRes.Groups))
+	for _, g := range scanRes.Groups {
+		byName[g.Filename] = g
+	}
+
+	checkGenresAndPoster := func(name, wantSummary string, wantGenres []string) {
+		t.Helper()
+		g, ok := byName[name]
+		if !ok {
+			t.Fatalf("missing group %q in scan result", name)
+		}
+		if g.ArrSummary != wantSummary {
+			t.Fatalf("%s: expected ArrSummary=%q, got %q (%+v)", name, wantSummary, g.ArrSummary, g.ArrMatches)
+		}
+		if len(g.ArrMatches) == 0 {
+			t.Fatalf("%s: expected ArrMatches non-empty", name)
+		}
+		m := g.ArrMatches[0]
+		if !m.HasPoster {
+			t.Fatalf("%s: expected HasPoster=true, got false (%+v)", name, m)
+		}
+		if len(m.Genres) != len(wantGenres) {
+			t.Fatalf("%s: expected Genres=%v, got %v", name, wantGenres, m.Genres)
+		}
+		for i := range wantGenres {
+			if m.Genres[i] != wantGenres[i] {
+				t.Fatalf("%s: expected Genres=%v, got %v", name, wantGenres, m.Genres)
+			}
+		}
+	}
+
+	checkGenresAndPoster("Inception (2010).mkv", "IMPORTED", []string{"Sci-Fi", "Thriller"})
+	checkGenresAndPoster("Dune.Part.Two.2024.1080p.mkv", "WANTED_NOT_IMPORTED", []string{"Action", "Adventure"})
+	checkGenresAndPoster("Heat.1995.BluRay.mkv", "IN_QUEUE_BLOCKED", []string{"Crime", "Drama"})
+	checkGenresAndPoster("Andor.S01E01.mkv", "UNLINKED_IN_LIBRARY", []string{"Action", "Sci-Fi"})
+	checkGenresAndPoster("Severance.S01E01.720p.mkv", "REPLACED_IN_ARR", []string{"Drama", "Mystery"})
+	checkGenresAndPoster("Silo.S01E01.1080p.mkv", "WANTED_NOT_IMPORTED", []string{"Drama", "Sci-Fi"})
+
+	// Verify /api/arr/poster 200 (local Arr proxy), 200 (remote fallback without leaking X-Api-Key), 404, 400
+	fetchPoster := func(query string) (int, http.Header, []byte) {
+		t.Helper()
+		resp, err := http.Get(ts.URL + "/api/arr/poster" + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, resp.Header, body
+	}
+
+	code, hdr, body := fetchPoster("?instance_id=rad1&item_id=10")
+	if code != http.StatusOK || !strings.HasPrefix(hdr.Get("Content-Type"), "image/png") || !strings.Contains(hdr.Get("Cache-Control"), "max-age") || !bytes.Equal(body, radarrPosterPNG) {
+		t.Fatalf("unexpected local Radarr poster response: code=%d ct=%q cc=%q len=%d", code, hdr.Get("Content-Type"), hdr.Get("Cache-Control"), len(body))
+	}
+
+	code, hdr, body = fetchPoster("?instance_id=son1&item_id=70")
+	if code != http.StatusOK || !strings.HasPrefix(hdr.Get("Content-Type"), "image/png") || !bytes.Equal(body, sonarrPosterPNG) {
+		t.Fatalf("unexpected local Sonarr poster response: code=%d ct=%q len=%d", code, hdr.Get("Content-Type"), len(body))
+	}
+
+	code, hdr, body = fetchPoster("?instance_id=rad1&item_id=20")
+	if code != http.StatusOK || !strings.HasPrefix(hdr.Get("Content-Type"), "image/png") || !bytes.Equal(body, remotePosterPNG) {
+		t.Fatalf("unexpected remote fallback poster response: code=%d ct=%q len=%d", code, hdr.Get("Content-Type"), len(body))
+	}
+	remoteMu.Lock()
+	leakedKey := remoteSawApiKey
+	remoteMu.Unlock()
+	if leakedKey {
+		t.Fatalf("poster proxy leaked X-Api-Key header to external remoteUrl")
+	}
+
+	if code, _, _ = fetchPoster("?instance_id=unknown&item_id=10"); code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown instance_id, got %d", code)
+	}
+	if code, _, _ = fetchPoster("?instance_id=son1&item_id=9999"); code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing poster item_id, got %d", code)
+	}
+	for _, bad := range []string{"?instance_id=rad1", "?instance_id=rad1&item_id=0", "?instance_id=rad1&item_id=abc", "?item_id=10"} {
+		if code, _, _ = fetchPoster(bad); code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for query %q, got %d", bad, code)
+		}
+	}
+}
+

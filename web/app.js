@@ -4,6 +4,7 @@
   const state = {
     config: {
       read_only_mode: true,
+      show_media_metadata: true,
       folders: [],
       qbit_instances: [],
       arr_instances: [],
@@ -17,6 +18,7 @@
     seedingFilter: "ALL",
     arrFilter: "ALL",
     folderFilter: "ALL",
+    genreFilter: "ALL",
     sortBy: "default",
     viewMode: "grouped",
     page: 1,
@@ -189,6 +191,51 @@
     } else {
       $("scanMeta").textContent = "Not scanned yet";
     }
+    renderGenreFilterOptions();
+  }
+
+  function renderGenreFilterOptions() {
+    const sel = $("genreFilter");
+    if (!sel) return;
+    if (!isMediaMetadataEnabled() || !state.scan || !Array.isArray(state.scan.groups)) {
+      sel.hidden = true;
+      sel.innerHTML = `<option value="ALL">All Genres</option>`;
+      state.genreFilter = "ALL";
+      return;
+    }
+
+    const byLower = new Map();
+    for (const grp of state.scan.groups) {
+      for (const m of grp.arr_matches || []) {
+        for (const raw of m.genres || []) {
+          const g = String(raw || "").trim();
+          if (!g) continue;
+          const lk = g.toLowerCase();
+          if (!byLower.has(lk)) byLower.set(lk, g);
+        }
+      }
+    }
+
+    const genres = [...byLower.values()].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+    if (genres.length === 0) {
+      sel.hidden = true;
+      sel.innerHTML = `<option value="ALL">All Genres</option>`;
+      state.genreFilter = "ALL";
+      return;
+    }
+
+    const prev = state.genreFilter;
+    sel.innerHTML = `<option value="ALL">All Genres</option>` +
+      genres.map((g) => `<option value="${escapeHtml(g)}">${escapeHtml(g)}</option>`).join("");
+    if (prev !== "ALL" && genres.some((g) => g.toLowerCase() === prev.toLowerCase())) {
+      const exact = genres.find((g) => g.toLowerCase() === prev.toLowerCase());
+      state.genreFilter = exact;
+      sel.value = exact;
+    } else {
+      state.genreFilter = "ALL";
+      sel.value = "ALL";
+    }
+    sel.hidden = false;
   }
 
   function renderAlerts() {
@@ -560,6 +607,14 @@
         if (!files.some((f) => f.folder_id === state.folderFilter)) return false;
       }
 
+      if (state.genreFilter !== "ALL" && isMediaMetadataEnabled()) {
+        const targetGenre = state.genreFilter.toLowerCase();
+        const hasGenre = (grp.arr_matches || []).some((m) =>
+          (m.genres || []).some((gn) => String(gn || "").toLowerCase() === targetGenre)
+        );
+        if (!hasGenre) return false;
+      }
+
       if (q) {
         const hay = [
           grp.filename,
@@ -570,7 +625,8 @@
             (t) => `${t.torrent_name} ${t.tracker_host} ${t.instance_name} ${t.tracker_health || ""} ${t.tracker_msg || ""}`
           ),
           ...(grp.arr_matches || []).map(
-            (m) => `${m.instance_name} ${m.app_type} ${m.title} ${m.status_message || ""} ${m.existing_file_name || ""}`
+            (m) =>
+              `${m.instance_name} ${m.app_type} ${m.title} ${m.status_message || ""} ${m.existing_file_name || ""} ${(m.genres || []).join(" ")}`
           ),
         ]
           .join(" ")
@@ -678,6 +734,78 @@
     }
   }
 
+  function isMediaMetadataEnabled() {
+    return state.config.show_media_metadata !== false;
+  }
+
+  function posterUrlFor(instanceId, itemId) {
+    return `/api/arr/poster?instance_id=${encodeURIComponent(instanceId)}&item_id=${encodeURIComponent(itemId)}`;
+  }
+
+  function pickPreferredArrMatch(arrMatches) {
+    const order = { imported: 0, wanted_title: 1, queue: 2, library_unlinked: 3, replaced: 4 };
+    const candidates = (arrMatches || []).filter(
+      (m) => m && m.item_id > 0 && (m.has_poster || (m.genres && m.genres.length > 0))
+    );
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => {
+      const pa = Object.prototype.hasOwnProperty.call(order, a.match_kind) ? order[a.match_kind] : 9;
+      const pb = Object.prototype.hasOwnProperty.call(order, b.match_kind) ? order[b.match_kind] : 9;
+      if (pa !== pb) return pa - pb;
+      return (b.has_poster ? 1 : 0) - (a.has_poster ? 1 : 0);
+    });
+    return candidates[0];
+  }
+
+  function getGroupMediaMeta(grp) {
+    const m = pickPreferredArrMatch(grp && grp.arr_matches);
+    if (!m) return null;
+    return {
+      instanceId: m.instance_id,
+      itemId: m.item_id,
+      title: renderArrTitle(m),
+      genres: m.genres || [],
+      hasPoster: Boolean(m.has_poster),
+    };
+  }
+
+  function getPackMediaMeta(pack) {
+    const rep = pack && pack.repArrMatch;
+    if (rep && rep.item_id > 0 && (rep.has_poster || (rep.genres && rep.genres.length > 0))) {
+      return {
+        instanceId: rep.instance_id,
+        itemId: rep.item_id,
+        title: rep.year > 0 ? `${rep.title} (${rep.year})` : rep.title || pack.title,
+        genres: rep.genres || [],
+        hasPoster: Boolean(rep.has_poster),
+      };
+    }
+    for (const m of (pack && pack.members) || []) {
+      const meta = getGroupMediaMeta(m);
+      if (meta) return meta;
+    }
+    return null;
+  }
+
+  function renderPosterThumbHtml(meta) {
+    if (!isMediaMetadataEnabled() || !meta || !meta.hasPoster || !meta.itemId) return "";
+    const url = posterUrlFor(meta.instanceId, meta.itemId);
+    return `<div class="poster-thumb-wrap" data-poster-url="${escapeHtml(url)}" data-poster-title="${escapeHtml(meta.title || "")}" data-poster-genres="${escapeHtml((meta.genres || []).join(", "))}">
+      <img class="poster-thumb" src="${escapeHtml(url)}" alt="" loading="lazy" decoding="async" onerror="this.parentElement.hidden=true" />
+    </div>`;
+  }
+
+  function renderGenrePillsHtml(genres, limit = 3) {
+    if (!isMediaMetadataEnabled() || !Array.isArray(genres) || genres.length === 0) return "";
+    const show = limit > 0 && genres.length > limit ? genres.slice(0, limit) : genres;
+    const pills = show.map((g) => `<span class="genre-pill">${escapeHtml(g)}</span>`).join("");
+    if (limit > 0 && genres.length > limit) {
+      const rest = genres.slice(limit).join(", ");
+      return `${pills}<span class="genre-pill" title="${escapeHtml(rest)}">+${genres.length - limit}</span>`;
+    }
+    return pills;
+  }
+
   function renderArrTitle(m) {
     if (m.app_type === "sonarr" && (m.season_number > 0 || m.episode_number > 0)) {
       const epStr = `S${String(m.season_number || 0).padStart(2, "0")}E${String(m.episode_number || 0).padStart(2, "0")}`;
@@ -738,22 +866,35 @@
               .map((m) => {
                 const isIssue = m.can_import || m.can_rescan;
                 const monLabel = m.monitored ? "Monitored" : "Unmonitored";
+                const showMeta = isMediaMetadataEnabled();
+                const posterHtml =
+                  showMeta && m.has_poster && m.item_id > 0
+                    ? `<img class="arr-detail-poster" src="${escapeHtml(posterUrlFor(m.instance_id, m.item_id))}" alt="" loading="lazy" decoding="async" onerror="this.hidden=true" />`
+                    : "";
+                const genresHtml =
+                  showMeta && m.genres && m.genres.length > 0
+                    ? `<div class="arr-genres-row">${renderGenrePillsHtml(m.genres, 0)}</div>`
+                    : "";
+                const bodyHtml = `
+                  <div class="torrent-top">
+                    <span class="arr-type-badge">${escapeHtml(m.app_type)}</span>
+                    <span class="instance-badge">${escapeHtml(m.instance_name)}</span>
+                    <span class="nlink-badge">${monLabel}</span>
+                  </div>
+                  <div class="torrent-name">${escapeHtml(renderArrTitle(m))}</div>
+                  ${genresHtml}
+                  ${
+                    m.existing_file_name
+                      ? `<div class="torrent-sub">Arr already has another file:</div><div class="arr-existing-file" title="${escapeHtml(m.existing_file_path || m.existing_file_name)}">${escapeHtml(m.existing_file_name)}</div>`
+                      : m.status_message
+                        ? `<div class="${isIssue ? "arr-msg" : "torrent-sub"}">${escapeHtml(m.status_message)}</div>`
+                        : ""
+                  }
+                  ${m.root_path ? `<div class="torrent-sub" title="${escapeHtml(m.root_path)}">Library: ${escapeHtml(m.root_path)}</div>` : ""}
+                `;
                 return `
               <div class="arr-item ${isIssue ? "has-issue" : ""}">
-                <div class="torrent-top">
-                  <span class="arr-type-badge">${escapeHtml(m.app_type)}</span>
-                  <span class="instance-badge">${escapeHtml(m.instance_name)}</span>
-                  <span class="nlink-badge">${monLabel}</span>
-                </div>
-                <div class="torrent-name">${escapeHtml(renderArrTitle(m))}</div>
-                ${
-                  m.existing_file_name
-                    ? `<div class="torrent-sub">Arr already has another file:</div><div class="arr-existing-file" title="${escapeHtml(m.existing_file_path || m.existing_file_name)}">${escapeHtml(m.existing_file_name)}</div>`
-                    : m.status_message
-                      ? `<div class="${isIssue ? "arr-msg" : "torrent-sub"}">${escapeHtml(m.status_message)}</div>`
-                      : ""
-                }
-                ${m.root_path ? `<div class="torrent-sub" title="${escapeHtml(m.root_path)}">Library: ${escapeHtml(m.root_path)}</div>` : ""}
+                ${posterHtml ? `<div class="arr-item-with-poster">${posterHtml}<div class="arr-item-body">${bodyHtml}</div></div>` : bodyHtml}
               </div>`;
               })
               .join("");
@@ -942,6 +1083,10 @@
       ? `<div class="arr-sync-badge">Syncing Arr...</div>`
       : "";
 
+    const mediaMeta = !isPackChild ? getGroupMediaMeta(grp) : null;
+    const thumbHtml = renderPosterThumbHtml(mediaMeta);
+    const genrePills = mediaMeta ? renderGenrePillsHtml(mediaMeta.genres, 3) : "";
+
     const mainRowHtml = `
       <tr class="main-row ${isPackChild ? "pack-child-row" : ""} ${isExpanded ? "is-expanded" : ""}" data-group-id="${escapeHtml(grp.id)}">
         <td class="col-check">
@@ -951,10 +1096,16 @@
           </div>
         </td>
         <td class="col-file">
-          <div class="file-name" title="${escapeHtml(grp.filename)}">${escapeHtml(grp.filename)}</div>
-          <div class="file-meta">
-            <span>${formatBytes(grp.size)}</span>
-            <span>${escapeHtml(grp.ext || "file")}</span>
+          <div class="file-cell-layout">
+            ${thumbHtml}
+            <div class="file-cell-main">
+              <div class="file-name" title="${escapeHtml(grp.filename)}">${escapeHtml(grp.filename)}</div>
+              <div class="file-meta">
+                <span>${formatBytes(grp.size)}</span>
+                <span>${escapeHtml(grp.ext || "file")}</span>
+                ${genrePills}
+              </div>
+            </div>
           </div>
         </td>
         <td class="col-folders">
@@ -1087,6 +1238,9 @@
       : formatCompactPackFolders(pack);
 
     const arrSyncHtml = pack.anySyncingArr ? `<div class="arr-sync-badge">Syncing Arr...</div>` : "";
+    const packMeta = getPackMediaMeta(pack);
+    const thumbHtml = renderPosterThumbHtml(packMeta);
+    const genrePills = packMeta ? renderGenrePillsHtml(packMeta.genres, 3) : "";
 
     const packMainHtml = `
       <tr class="main-row pack-row ${isExpanded ? "is-expanded" : ""}" data-pack-id="${escapeHtml(pack.id)}">
@@ -1097,13 +1251,19 @@
           </div>
         </td>
         <td class="col-file">
-          <div class="file-name-wrap">
-            <span class="pack-badge">PACK</span>
-            <div class="file-name" title="${escapeHtml(pack.title)}">${escapeHtml(pack.title)}</div>
-          </div>
-          <div class="file-meta">
-            <span>${formatBytes(pack.size)}</span>
-            <span>${escapeHtml(fileMetaExtra)}</span>
+          <div class="file-cell-layout">
+            ${thumbHtml}
+            <div class="file-cell-main">
+              <div class="file-name-wrap">
+                <span class="pack-badge">PACK</span>
+                <div class="file-name" title="${escapeHtml(pack.title)}">${escapeHtml(pack.title)}</div>
+              </div>
+              <div class="file-meta">
+                <span>${formatBytes(pack.size)}</span>
+                <span>${escapeHtml(fileMetaExtra)}</span>
+                ${genrePills}
+              </div>
+            </div>
           </div>
         </td>
         <td class="col-folders">
@@ -1138,7 +1298,59 @@
     return packMainHtml + pack.members.map((m) => renderFileRow(m, true)).join("");
   }
 
+  function hidePosterHoverCard() {
+    const card = $("posterHoverCard");
+    if (card) card.hidden = true;
+  }
+
+  function showPosterHoverCard(wrapEl) {
+    if (!window.matchMedia || !window.matchMedia("(hover: hover)").matches) return;
+    const card = $("posterHoverCard");
+    const img = $("posterHoverImg");
+    const titleEl = $("posterHoverTitle");
+    const genresEl = $("posterHoverGenres");
+    if (!card || !img || !titleEl || !genresEl) return;
+
+    const url = wrapEl.dataset.posterUrl || "";
+    if (!url) return;
+    const title = wrapEl.dataset.posterTitle || "";
+    const genres = (wrapEl.dataset.posterGenres || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    img.src = url;
+    titleEl.textContent = title;
+    genresEl.innerHTML = genres
+      .slice(0, 4)
+      .map((g) => `<span class="genre-pill">${escapeHtml(g)}</span>`)
+      .join("");
+
+    card.style.left = "-9999px";
+    card.style.top = "-9999px";
+    card.hidden = false;
+
+    const rect = wrapEl.getBoundingClientRect();
+    const cardW = card.offsetWidth || 164;
+    const cardH = card.offsetHeight || 280;
+    let left = rect.right + 10;
+    if (left + cardW > window.innerWidth - 10) {
+      left = rect.left - cardW - 10;
+    }
+    left = Math.max(8, left);
+
+    let top = rect.top - 16;
+    if (top + cardH > window.innerHeight - 10) {
+      top = window.innerHeight - cardH - 10;
+    }
+    top = Math.max(8, top);
+
+    card.style.left = `${Math.round(left)}px`;
+    card.style.top = `${Math.round(top)}px`;
+  }
+
   function renderTable() {
+    hidePosterHoverCard();
     const tbody = $("auditTableBody");
     const filteredGroups = getFilteredGroups();
     const displayRows = buildPackDisplayRows(filteredGroups);
@@ -2655,6 +2867,9 @@
     }
     $("ignoreExtInput").value = (state.draftConfig.ignore_extensions || []).join(", ");
     $("minSizeInput").value = String(state.draftConfig.min_size_bytes || 0);
+    if ($("showMediaMetadataCheckbox")) {
+      $("showMediaMetadataCheckbox").checked = state.draftConfig.show_media_metadata !== false;
+    }
     renderSettingsEditors();
     switchSettingsTab(state.activeSettingsTab || "folders");
     $("settingsModal").hidden = false;
@@ -2891,6 +3106,19 @@
       .map((s) => s.trim())
       .filter(Boolean);
     state.draftConfig.min_size_bytes = Math.max(0, Number($("minSizeInput").value || 0));
+    if ($("showMediaMetadataCheckbox")) {
+      state.draftConfig.show_media_metadata = Boolean($("showMediaMetadataCheckbox").checked);
+    }
+  }
+
+  function scanConfigKey(cfg) {
+    return JSON.stringify({
+      folders: cfg.folders || [],
+      qbit_instances: cfg.qbit_instances || [],
+      arr_instances: cfg.arr_instances || [],
+      ignore_extensions: cfg.ignore_extensions || [],
+      min_size_bytes: Number(cfg.min_size_bytes || 0),
+    });
   }
 
   async function saveSettingsAndScan() {
@@ -2912,14 +3140,23 @@
         })),
     };
 
+    const prevScanKey = scanConfigKey(state.config);
+    const nextScanKey = scanConfigKey(cleaned);
+    const skipRescan = Boolean(state.scan) && prevScanKey === nextScanKey;
+
     try {
       state.config = await apiFetch("/api/config", {
         method: "PUT",
         body: JSON.stringify(cleaned),
       });
       $("settingsModal").hidden = true;
-      showToast("Settings saved.", "success");
-      await runScan();
+      if (skipRescan) {
+        renderAll();
+        showToast("Display settings saved.", "success");
+      } else {
+        showToast("Settings saved.", "success");
+        await runScan();
+      }
     } catch (err) {
       showToast(`Invalid settings: ${err.message}`, "error");
     }
@@ -3034,6 +3271,11 @@
     });
     $("folderFilter").addEventListener("change", (e) => {
       state.folderFilter = e.target.value;
+      state.page = 1;
+      renderTable();
+    });
+    $("genreFilter").addEventListener("change", (e) => {
+      state.genreFilter = e.target.value;
       state.page = 1;
       renderTable();
     });
@@ -3444,6 +3686,17 @@
         browsePickerPath(btn.dataset.path);
       }
     });
+    $("auditTableBody").addEventListener("mouseover", (e) => {
+      const wrap = e.target.closest(".poster-thumb-wrap");
+      if (wrap) showPosterHoverCard(wrap);
+    });
+    $("auditTableBody").addEventListener("mouseout", (e) => {
+      const wrap = e.target.closest(".poster-thumb-wrap");
+      if (wrap && (!e.relatedTarget || !wrap.contains(e.relatedTarget))) {
+        hidePosterHoverCard();
+      }
+    });
+    window.addEventListener("scroll", hidePosterHoverCard, { passive: true });
     $("selectPickerBtn").addEventListener("click", () => {
       if (state.pickerTargetIndex !== null && state.pickerCurrentPath) {
         state.draftConfig.folders[state.pickerTargetIndex].path = state.pickerCurrentPath;

@@ -45,18 +45,20 @@ type InstanceReport struct {
 }
 
 type ArrFileEntry struct {
-	InstanceID   string `json:"instance_id"`
-	InstanceName string `json:"instance_name"`
-	AppType      string `json:"app_type"`
-	ItemID       int    `json:"item_id"`
-	Title        string `json:"title"`
-	Year         int    `json:"year,omitempty"`
-	SeasonNumber int    `json:"season_number,omitempty"`
-	Monitored    bool   `json:"monitored"`
-	RemotePath   string `json:"remote_path"`
-	MappedPath   string `json:"mapped_path"`
-	Filename     string `json:"-"`
-	Size         int64  `json:"size"`
+	InstanceID   string   `json:"instance_id"`
+	InstanceName string   `json:"instance_name"`
+	AppType      string   `json:"app_type"`
+	ItemID       int      `json:"item_id"`
+	Title        string   `json:"title"`
+	Year         int      `json:"year,omitempty"`
+	SeasonNumber int      `json:"season_number,omitempty"`
+	Monitored    bool     `json:"monitored"`
+	RemotePath   string   `json:"remote_path"`
+	MappedPath   string   `json:"mapped_path"`
+	Filename     string   `json:"-"`
+	Size         int64    `json:"size"`
+	Genres       []string `json:"genres,omitempty"`
+	HasPoster    bool     `json:"has_poster,omitempty"`
 }
 
 type ArrFileMatch struct {
@@ -82,33 +84,37 @@ type ArrQueueEntry struct {
 }
 
 type ArrLibraryEntry struct {
-	InstanceID   string `json:"instance_id"`
-	InstanceName string `json:"instance_name"`
-	AppType      string `json:"app_type"`
-	ItemID       int    `json:"item_id"`
-	Title        string `json:"title"`
-	Year         int    `json:"year,omitempty"`
-	Monitored    bool   `json:"monitored"`
-	HasFile      bool   `json:"has_file"`
-	RemotePath   string `json:"remote_path"`
-	MappedPath   string `json:"mapped_path"`
+	InstanceID   string   `json:"instance_id"`
+	InstanceName string   `json:"instance_name"`
+	AppType      string   `json:"app_type"`
+	ItemID       int      `json:"item_id"`
+	Title        string   `json:"title"`
+	Year         int      `json:"year,omitempty"`
+	Monitored    bool     `json:"monitored"`
+	HasFile      bool     `json:"has_file"`
+	RemotePath   string   `json:"remote_path"`
+	MappedPath   string   `json:"mapped_path"`
+	Genres       []string `json:"genres,omitempty"`
+	HasPoster    bool     `json:"has_poster,omitempty"`
 }
 
 type ArrTitleMatch struct {
-	InstanceID       string `json:"instance_id"`
-	InstanceName     string `json:"instance_name"`
-	AppType          string `json:"app_type"`
-	ItemID           int    `json:"item_id"`
-	EpisodeIDs       []int  `json:"episode_ids,omitempty"`
-	Title            string `json:"title"`
-	Year             int    `json:"year,omitempty"`
-	SeasonNumber     int    `json:"season_number,omitempty"`
-	EpisodeNumber    int    `json:"episode_number,omitempty"`
-	Monitored        bool   `json:"monitored"`
-	HasFile          bool   `json:"has_file"`
-	RootPath         string `json:"root_path"`
-	ExistingFileName string `json:"existing_file_name,omitempty"`
-	ExistingFilePath string `json:"existing_file_path,omitempty"`
+	InstanceID       string   `json:"instance_id"`
+	InstanceName     string   `json:"instance_name"`
+	AppType          string   `json:"app_type"`
+	ItemID           int      `json:"item_id"`
+	EpisodeIDs       []int    `json:"episode_ids,omitempty"`
+	Title            string   `json:"title"`
+	Year             int      `json:"year,omitempty"`
+	SeasonNumber     int      `json:"season_number,omitempty"`
+	EpisodeNumber    int      `json:"episode_number,omitempty"`
+	Monitored        bool     `json:"monitored"`
+	HasFile          bool     `json:"has_file"`
+	RootPath         string   `json:"root_path"`
+	ExistingFileName string   `json:"existing_file_name,omitempty"`
+	ExistingFilePath string   `json:"existing_file_path,omitempty"`
+	Genres           []string `json:"genres,omitempty"`
+	HasPoster        bool     `json:"has_poster,omitempty"`
 }
 
 type radarrTitleItem struct {
@@ -123,6 +129,8 @@ type radarrTitleItem struct {
 	RootPath         string
 	ExistingFileName string
 	ExistingFilePath string
+	Genres           []string
+	HasPoster        bool
 }
 
 type sonarrSeriesItem struct {
@@ -136,7 +144,16 @@ type sonarrSeriesItem struct {
 	Year          int
 	Monitored     bool
 	RootPath      string
+	Genres        []string
+	HasPoster     bool
 }
+
+type PosterInfo struct {
+	LocalURL  string
+	RemoteURL string
+}
+
+var ErrPosterNotFound = errors.New("poster not found")
 
 type wantedEpisodeKey struct {
 	InstanceID string
@@ -166,6 +183,7 @@ type Index struct {
 	SonarrSeries     []sonarrSeriesItem
 	WantedEpisodes   map[wantedEpisodeKey]wantedEpisodeInfo
 	ExistingEpisodes map[wantedEpisodeKey]ArrFileEntry
+	PosterMeta       map[string]PosterInfo
 	Instances        []InstanceReport
 }
 
@@ -180,6 +198,7 @@ func NewIndex() *Index {
 		SonarrSeries:     make([]sonarrSeriesItem, 0),
 		WantedEpisodes:   make(map[wantedEpisodeKey]wantedEpisodeInfo),
 		ExistingEpisodes: make(map[wantedEpisodeKey]ArrFileEntry),
+		PosterMeta:       make(map[string]PosterInfo),
 		Instances:        make([]InstanceReport, 0),
 	}
 }
@@ -455,6 +474,8 @@ func (idx *Index) FindTitleMatches(filename, torrentName string) []ArrTitleMatch
 				RootPath:         m.RootPath,
 				ExistingFileName: m.ExistingFileName,
 				ExistingFilePath: m.ExistingFilePath,
+				Genres:           m.Genres,
+				HasPoster:        m.HasPoster,
 			})
 		}
 	}
@@ -563,6 +584,8 @@ func (idx *Index) FindTitleMatches(filename, torrentName string) []ArrTitleMatch
 					Monitored:     sr.Monitored && wantedEp.Monitored,
 					HasFile:       false,
 					RootPath:      sr.RootPath,
+					Genres:        sr.Genres,
+					HasPoster:     sr.HasPoster,
 				})
 			} else if existingEp, hasExisting := idx.ExistingEpisodes[wk]; hasExisting {
 				key := fmt.Sprintf("sonarr:%s:%d:S%dE%d", sr.InstanceID, sr.SeriesID, seasonNum, epNum)
@@ -584,6 +607,8 @@ func (idx *Index) FindTitleMatches(filename, torrentName string) []ArrTitleMatch
 					RootPath:         sr.RootPath,
 					ExistingFileName: existingEp.Filename,
 					ExistingFilePath: existingEp.MappedPath,
+					Genres:           sr.Genres,
+					HasPoster:        sr.HasPoster,
 				})
 			}
 		}
@@ -601,6 +626,12 @@ type systemStatusJSON struct {
 	Version string `json:"version"`
 }
 
+type arrImageJSON struct {
+	CoverType string `json:"coverType"`
+	URL       string `json:"url"`
+	RemoteURL string `json:"remoteUrl"`
+}
+
 type radarrMovieFileJSON struct {
 	ID           int    `json:"id"`
 	Path         string `json:"path"`
@@ -616,15 +647,19 @@ type radarrMovieJSON struct {
 	Path          string               `json:"path"`
 	HasFile       bool                 `json:"hasFile"`
 	Monitored     bool                 `json:"monitored"`
+	Genres        []string             `json:"genres"`
+	Images        []arrImageJSON       `json:"images"`
 	MovieFile     *radarrMovieFileJSON `json:"movieFile"`
 }
 
 type sonarrSeriesJSON struct {
-	ID        int    `json:"id"`
-	Title     string `json:"title"`
-	Year      int    `json:"year"`
-	Path      string `json:"path"`
-	Monitored bool   `json:"monitored"`
+	ID        int            `json:"id"`
+	Title     string         `json:"title"`
+	Year      int            `json:"year"`
+	Path      string         `json:"path"`
+	Monitored bool           `json:"monitored"`
+	Genres    []string       `json:"genres"`
+	Images    []arrImageJSON `json:"images"`
 }
 
 type sonarrEpisodeFileJSON struct {
@@ -855,6 +890,51 @@ type fetchedInstanceData struct {
 	radarrTitles   []radarrTitleItem
 	sonarrSeries   []sonarrSeriesItem
 	wantedEpisodes map[wantedEpisodeKey]wantedEpisodeInfo
+	posterMeta     map[string]PosterInfo
+}
+
+func normalizeGenres(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		g := strings.TrimSpace(raw)
+		if g == "" {
+			continue
+		}
+		lk := strings.ToLower(g)
+		if _, dup := seen[lk]; dup {
+			continue
+		}
+		seen[lk] = struct{}{}
+		out = append(out, g)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func extractPosterInfo(images []arrImageJSON) (PosterInfo, bool) {
+	for _, img := range images {
+		if !strings.EqualFold(strings.TrimSpace(img.CoverType), "poster") {
+			continue
+		}
+		info := PosterInfo{
+			LocalURL:  strings.TrimSpace(img.URL),
+			RemoteURL: strings.TrimSpace(img.RemoteURL),
+		}
+		if info.LocalURL != "" || info.RemoteURL != "" {
+			return info, true
+		}
+	}
+	return PosterInfo{}, false
+}
+
+func posterMetaKey(instID string, itemID int) string {
+	return fmt.Sprintf("%s:%d", instID, itemID)
 }
 
 func summarizeQueueRecord(inst config.ArrInstanceConfig, rec arrQueueRecordJSON) ArrQueueEntry {
@@ -934,6 +1014,7 @@ func (c *Client) fetchInstanceData(ctx context.Context, inst config.ArrInstanceC
 
 	out := fetchedInstanceData{
 		wantedEpisodes: make(map[wantedEpisodeKey]wantedEpisodeInfo),
+		posterMeta:     make(map[string]PosterInfo),
 	}
 
 	if inst.Type == "radarr" {
@@ -947,9 +1028,12 @@ func (c *Client) fetchInstanceData(ctx context.Context, inst config.ArrInstanceC
 		}
 
 		for _, m := range movies {
-			libEntry, titleItem, fileEntry := radarrMovieToData(inst, m)
+			libEntry, titleItem, fileEntry, posterInfo, hasPoster := radarrMovieToData(inst, m)
 			out.libraryRoots = append(out.libraryRoots, libEntry)
 			out.radarrTitles = append(out.radarrTitles, titleItem)
+			if hasPoster {
+				out.posterMeta[posterMetaKey(inst.ID, m.ID)] = posterInfo
+			}
 			if fileEntry != nil {
 				out.files = append(out.files, *fileEntry)
 			}
@@ -981,9 +1065,12 @@ func (c *Client) fetchInstanceData(ctx context.Context, inst config.ArrInstanceC
 	}
 
 	for _, s := range series {
-		libEntry, srItem := sonarrSeriesToData(inst, s)
+		libEntry, srItem, posterInfo, hasPoster := sonarrSeriesToData(inst, s)
 		out.libraryRoots = append(out.libraryRoots, libEntry)
 		out.sonarrSeries = append(out.sonarrSeries, srItem)
+		if hasPoster {
+			out.posterMeta[posterMetaKey(inst.ID, s.ID)] = posterInfo
+		}
 	}
 
 	// Fetch episode files concurrently across series (max 16 workers)
@@ -1064,8 +1151,11 @@ func (c *Client) fetchInstanceData(ctx context.Context, inst config.ArrInstanceC
 	return out
 }
 
-func radarrMovieToData(inst config.ArrInstanceConfig, m radarrMovieJSON) (ArrLibraryEntry, radarrTitleItem, *ArrFileEntry) {
+func radarrMovieToData(inst config.ArrInstanceConfig, m radarrMovieJSON) (ArrLibraryEntry, radarrTitleItem, *ArrFileEntry, PosterInfo, bool) {
 	mappedRoot := qbit.ApplyPathMappings(m.Path, inst.PathMappings)
+	genres := normalizeGenres(m.Genres)
+	posterInfo, hasPoster := extractPosterInfo(m.Images)
+
 	libEntry := ArrLibraryEntry{
 		InstanceID:   inst.ID,
 		InstanceName: inst.Name,
@@ -1077,6 +1167,8 @@ func radarrMovieToData(inst config.ArrInstanceConfig, m radarrMovieJSON) (ArrLib
 		HasFile:      m.HasFile,
 		RemotePath:   qbit.NormalizeSlashPath(m.Path),
 		MappedPath:   mappedRoot,
+		Genres:       genres,
+		HasPoster:    hasPoster,
 	}
 
 	normTitles := make([]string, 0, 2)
@@ -1110,6 +1202,8 @@ func radarrMovieToData(inst config.ArrInstanceConfig, m radarrMovieJSON) (ArrLib
 				MappedPath:   mapped,
 				Filename:     existingFileName,
 				Size:         m.MovieFile.Size,
+				Genres:       genres,
+				HasPoster:    hasPoster,
 			}
 		} else if m.MovieFile.RelativePath != "" {
 			existingFileName = path.Base(qbit.NormalizeSlashPath(m.MovieFile.RelativePath))
@@ -1128,12 +1222,17 @@ func radarrMovieToData(inst config.ArrInstanceConfig, m radarrMovieJSON) (ArrLib
 		RootPath:         mappedRoot,
 		ExistingFileName: existingFileName,
 		ExistingFilePath: existingFilePath,
+		Genres:           genres,
+		HasPoster:        hasPoster,
 	}
-	return libEntry, titleItem, fileEntry
+	return libEntry, titleItem, fileEntry, posterInfo, hasPoster
 }
 
-func sonarrSeriesToData(inst config.ArrInstanceConfig, s sonarrSeriesJSON) (ArrLibraryEntry, sonarrSeriesItem) {
+func sonarrSeriesToData(inst config.ArrInstanceConfig, s sonarrSeriesJSON) (ArrLibraryEntry, sonarrSeriesItem, PosterInfo, bool) {
 	mappedRoot := qbit.ApplyPathMappings(s.Path, inst.PathMappings)
+	genres := normalizeGenres(s.Genres)
+	posterInfo, hasPoster := extractPosterInfo(s.Images)
+
 	libEntry := ArrLibraryEntry{
 		InstanceID:   inst.ID,
 		InstanceName: inst.Name,
@@ -1145,6 +1244,8 @@ func sonarrSeriesToData(inst config.ArrInstanceConfig, s sonarrSeriesJSON) (ArrL
 		HasFile:      false,
 		RemotePath:   qbit.NormalizeSlashPath(s.Path),
 		MappedPath:   mappedRoot,
+		Genres:       genres,
+		HasPoster:    hasPoster,
 	}
 	normTitle := normalizeTitle(s.Title)
 	baseNormTitle := normTitle
@@ -1170,11 +1271,15 @@ func sonarrSeriesToData(inst config.ArrInstanceConfig, s sonarrSeriesJSON) (ArrL
 		Year:          year,
 		Monitored:     s.Monitored,
 		RootPath:      mappedRoot,
+		Genres:        genres,
+		HasPoster:     hasPoster,
 	}
-	return libEntry, srItem
+	return libEntry, srItem, posterInfo, hasPoster
 }
 
 func sonarrEpisodeFilesToEntries(inst config.ArrInstanceConfig, sr sonarrSeriesJSON, epFiles []sonarrEpisodeFileJSON) []ArrFileEntry {
+	genres := normalizeGenres(sr.Genres)
+	_, hasPoster := extractPosterInfo(sr.Images)
 	out := make([]ArrFileEntry, 0, len(epFiles))
 	for _, ef := range epFiles {
 		rawPath := ef.Path
@@ -1198,6 +1303,8 @@ func sonarrEpisodeFilesToEntries(inst config.ArrInstanceConfig, sr sonarrSeriesJ
 			MappedPath:   mapped,
 			Filename:     path.Base(mapped),
 			Size:         ef.Size,
+			Genres:       genres,
+			HasPoster:    hasPoster,
 		})
 	}
 	return out
@@ -1239,6 +1346,9 @@ func mergeFetchedToIndex(idx *Index, results []fetchedInstanceData, includeEmpty
 		idx.SonarrSeries = append(idx.SonarrSeries, r.sonarrSeries...)
 		for k, v := range r.wantedEpisodes {
 			idx.WantedEpisodes[k] = v
+		}
+		for k, v := range r.posterMeta {
+			idx.PosterMeta[k] = v
 		}
 	}
 }
@@ -1283,6 +1393,7 @@ func uniquePositiveIDs(ids []int) []int {
 func (c *Client) fetchInstanceItemsData(ctx context.Context, inst config.ArrInstanceConfig, itemIDs []int, includeQueue bool) (fetchedInstanceData, []string) {
 	out := fetchedInstanceData{
 		wantedEpisodes: make(map[wantedEpisodeKey]wantedEpisodeInfo),
+		posterMeta:     make(map[string]PosterInfo),
 	}
 	if !inst.Enabled {
 		return out, nil
@@ -1331,10 +1442,13 @@ func (c *Client) fetchInstanceItemsData(ctx context.Context, inst config.ArrInst
 					mu.Unlock()
 					return
 				}
-				libEntry, titleItem, fileEntry := radarrMovieToData(inst, m)
+				libEntry, titleItem, fileEntry, posterInfo, hasPoster := radarrMovieToData(inst, m)
 				mu.Lock()
 				out.libraryRoots = append(out.libraryRoots, libEntry)
 				out.radarrTitles = append(out.radarrTitles, titleItem)
+				if hasPoster {
+					out.posterMeta[posterMetaKey(inst.ID, m.ID)] = posterInfo
+				}
 				if fileEntry != nil {
 					out.files = append(out.files, *fileEntry)
 					if fileEntry.MappedPath != "" {
@@ -1366,10 +1480,13 @@ func (c *Client) fetchInstanceItemsData(ctx context.Context, inst config.ArrInst
 					return
 				}
 
-				libEntry, srItem := sonarrSeriesToData(inst, sr)
+				libEntry, srItem, posterInfo, hasPoster := sonarrSeriesToData(inst, sr)
 				mu.Lock()
 				out.libraryRoots = append(out.libraryRoots, libEntry)
 				out.sonarrSeries = append(out.sonarrSeries, srItem)
+				if hasPoster {
+					out.posterMeta[posterMetaKey(inst.ID, sr.ID)] = posterInfo
+				}
 				mu.Unlock()
 
 				var epFiles []sonarrEpisodeFileJSON
@@ -1580,6 +1697,95 @@ func (c *Client) TriggerManualImport(ctx context.Context, inst config.ArrInstanc
 	var res CommandResponse
 	err := c.doJSON(ctx, http.MethodPost, baseURL+"/api/v3/command", inst.APIKey, payload, &res)
 	return res, err
+}
+
+func (c *Client) tryFetchImage(ctx context.Context, rawURL, apiKey string, sendAPIKey bool) ([]byte, string, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, "", false
+	}
+	if sendAPIKey && strings.TrimSpace(apiKey) != "" {
+		req.Header.Set("X-Api-Key", apiKey)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, "", false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", false
+	}
+
+	const maxPosterBytes = 5 << 20
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxPosterBytes+1))
+	if err != nil || len(data) == 0 || len(data) > maxPosterBytes {
+		return nil, "", false
+	}
+
+	ct := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
+	if ct == "" || !strings.HasPrefix(strings.ToLower(ct), "image/") {
+		ct = strings.TrimSpace(strings.Split(http.DetectContentType(data), ";")[0])
+	}
+	if !strings.HasPrefix(strings.ToLower(ct), "image/") {
+		return nil, "", false
+	}
+	return data, ct, true
+}
+
+// FetchPoster proxies an item's poster artwork from Radarr/Sonarr (with remote fallback if needed)
+// without exposing the instance API key to browser clients.
+func (c *Client) FetchPoster(ctx context.Context, inst config.ArrInstanceConfig, itemID int, fallback PosterInfo) ([]byte, string, error) {
+	if !inst.Enabled {
+		return nil, "", ErrPosterNotFound
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(inst.URL), "/")
+	if baseURL == "" || itemID <= 0 {
+		return nil, "", ErrPosterNotFound
+	}
+
+	seen := make(map[string]struct{}, 4)
+	tryCandidate := func(u string, sendKey bool) ([]byte, string, bool) {
+		if u == "" {
+			return nil, "", false
+		}
+		if _, dup := seen[u]; dup {
+			return nil, "", false
+		}
+		seen[u] = struct{}{}
+		return c.tryFetchImage(ctx, u, inst.APIKey, sendKey)
+	}
+
+	candidates := []string{
+		fmt.Sprintf("%s/api/v3/mediacover/%d/poster-250.jpg", baseURL, itemID),
+		fmt.Sprintf("%s/api/v3/mediacover/%d/poster.jpg", baseURL, itemID),
+	}
+	if strings.HasPrefix(fallback.LocalURL, "/") {
+		resolvedLocal := baseURL + fallback.LocalURL
+		if parsed, err := url.Parse(baseURL); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+			basePath := strings.TrimRight(parsed.Path, "/")
+			if basePath != "" && strings.HasPrefix(fallback.LocalURL, basePath+"/") {
+				resolvedLocal = parsed.Scheme + "://" + parsed.Host + fallback.LocalURL
+			}
+		}
+		candidates = append(candidates, resolvedLocal)
+	}
+
+	for _, u := range candidates {
+		if data, ct, ok := tryCandidate(u, true); ok {
+			return data, ct, nil
+		}
+	}
+
+	lowerRemote := strings.ToLower(fallback.RemoteURL)
+	if strings.HasPrefix(lowerRemote, "https://") || strings.HasPrefix(lowerRemote, "http://") {
+		if data, ct, ok := tryCandidate(fallback.RemoteURL, false); ok {
+			return data, ct, nil
+		}
+	}
+
+	return nil, "", ErrPosterNotFound
 }
 
 func (c *Client) TriggerRescan(ctx context.Context, inst config.ArrInstanceConfig, itemID int) (CommandResponse, error) {

@@ -32,8 +32,9 @@ type Server struct {
 	webFS      fs.FS
 	mux        *http.ServeMux
 
-	scanMu   sync.RWMutex
-	lastScan *scanner.ScanResult
+	scanMu     sync.RWMutex
+	lastScan   *scanner.ScanResult
+	posterMeta map[string]arr.PosterInfo
 }
 
 func New(cfgMgr *config.Manager, qbitClient *qbit.Client, arrClient *arr.Client, webFS fs.FS) *Server {
@@ -43,6 +44,7 @@ func New(cfgMgr *config.Manager, qbitClient *qbit.Client, arrClient *arr.Client,
 		arrClient:  arrClient,
 		webFS:      webFS,
 		mux:        http.NewServeMux(),
+		posterMeta: make(map[string]arr.PosterInfo),
 	}
 	s.registerRoutes()
 	return s
@@ -70,6 +72,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/actions/qbit-relocate/inspect", s.handleQbitRelocateInspect)
 	s.mux.HandleFunc("POST /api/actions/qbit-relocate", s.handleQbitRelocate)
 	s.mux.HandleFunc("POST /api/arr/commands/status", s.handleArrCommandsStatus)
+	s.mux.HandleFunc("GET /api/arr/poster", s.handleArrPoster)
 	s.mux.HandleFunc("GET /api/export", s.handleExport)
 
 	if s.webFS != nil {
@@ -281,6 +284,13 @@ func (s *Server) runAndStoreScan(r *http.Request) scanner.ScanResult {
 	s.scanMu.Lock()
 	copied := result
 	s.lastScan = &copied
+	nextPosters := make(map[string]arr.PosterInfo)
+	if arrIdx != nil {
+		for k, v := range arrIdx.PosterMeta {
+			nextPosters[k] = v
+		}
+	}
+	s.posterMeta = nextPosters
 	s.scanMu.Unlock()
 
 	return result
@@ -468,6 +478,14 @@ func (s *Server) handleRefreshGroups(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.scanMu.Lock()
+	if arrIdx != nil && len(arrIdx.PosterMeta) > 0 {
+		if s.posterMeta == nil {
+			s.posterMeta = make(map[string]arr.PosterInfo, len(arrIdx.PosterMeta))
+		}
+		for k, v := range arrIdx.PosterMeta {
+			s.posterMeta[k] = v
+		}
+	}
 	var nextSummary scanner.Summary
 	if s.lastScan != nil {
 		nextGroups := make([]scanner.ComparisonGroup, 0, len(s.lastScan.Groups))
@@ -771,6 +789,57 @@ func (s *Server) handleQbitRelocate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleArrPoster(w http.ResponseWriter, r *http.Request) {
+	instID := strings.TrimSpace(r.URL.Query().Get("instance_id"))
+	itemIDStr := strings.TrimSpace(r.URL.Query().Get("item_id"))
+	if instID == "" || itemIDStr == "" {
+		writeError(w, http.StatusBadRequest, "Missing instance_id or item_id")
+		return
+	}
+	itemID, err := strconv.Atoi(itemIDStr)
+	if err != nil || itemID <= 0 {
+		writeError(w, http.StatusBadRequest, "Invalid item_id")
+		return
+	}
+	if s.arrClient == nil {
+		writeError(w, http.StatusNotFound, "Radarr/Sonarr client unavailable")
+		return
+	}
+
+	settings := s.cfgMgr.Get()
+	var targetInst config.ArrInstanceConfig
+	found := false
+	for _, inst := range settings.ArrInstances {
+		if inst.ID == instID && inst.Enabled {
+			targetInst = inst
+			found = true
+			break
+		}
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "Unknown or disabled Radarr/Sonarr instance")
+		return
+	}
+
+	s.scanMu.RLock()
+	var fallback arr.PosterInfo
+	if s.posterMeta != nil {
+		fallback = s.posterMeta[fmt.Sprintf("%s:%d", targetInst.ID, itemID)]
+	}
+	s.scanMu.RUnlock()
+
+	data, contentType, err := s.arrClient.FetchPoster(r.Context(), targetInst, itemID, fallback)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Poster not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {

@@ -46,12 +46,13 @@ type ArrInstanceConfig struct {
 }
 
 type AppSettings struct {
-	ReadOnlyMode     bool                 `json:"read_only_mode"`
-	Folders          []FolderConfig       `json:"folders"`
-	QbitInstances    []QbitInstanceConfig `json:"qbit_instances"`
-	ArrInstances     []ArrInstanceConfig  `json:"arr_instances"`
-	IgnoreExtensions []string             `json:"ignore_extensions"`
-	MinSizeBytes     int64                `json:"min_size_bytes"`
+	ReadOnlyMode      bool                 `json:"read_only_mode"`
+	ShowMediaMetadata bool                 `json:"show_media_metadata"`
+	Folders           []FolderConfig       `json:"folders"`
+	QbitInstances     []QbitInstanceConfig `json:"qbit_instances"`
+	ArrInstances      []ArrInstanceConfig  `json:"arr_instances"`
+	IgnoreExtensions  []string             `json:"ignore_extensions"`
+	MinSizeBytes      int64                `json:"min_size_bytes"`
 }
 
 type Manager struct {
@@ -70,12 +71,13 @@ func randomID() string {
 
 func defaultSettings() AppSettings {
 	return AppSettings{
-		ReadOnlyMode:     true,
-		Folders:          []FolderConfig{},
-		QbitInstances:    []QbitInstanceConfig{},
-		ArrInstances:     []ArrInstanceConfig{},
-		IgnoreExtensions: []string{},
-		MinSizeBytes:     0,
+		ReadOnlyMode:      true,
+		ShowMediaMetadata: true,
+		Folders:           []FolderConfig{},
+		QbitInstances:     []QbitInstanceConfig{},
+		ArrInstances:      []ArrInstanceConfig{},
+		IgnoreExtensions:  []string{},
+		MinSizeBytes:      0,
 	}
 }
 
@@ -94,12 +96,13 @@ func normalizePathMappings(in []PathMapping) []PathMapping {
 
 func normalizeSettings(in AppSettings) (AppSettings, error) {
 	out := AppSettings{
-		ReadOnlyMode:     in.ReadOnlyMode,
-		Folders:          make([]FolderConfig, 0, len(in.Folders)),
-		QbitInstances:    make([]QbitInstanceConfig, 0, len(in.QbitInstances)),
-		ArrInstances:     make([]ArrInstanceConfig, 0, len(in.ArrInstances)),
-		IgnoreExtensions: make([]string, 0, len(in.IgnoreExtensions)),
-		MinSizeBytes:     in.MinSizeBytes,
+		ReadOnlyMode:      in.ReadOnlyMode,
+		ShowMediaMetadata: in.ShowMediaMetadata,
+		Folders:           make([]FolderConfig, 0, len(in.Folders)),
+		QbitInstances:     make([]QbitInstanceConfig, 0, len(in.QbitInstances)),
+		ArrInstances:      make([]ArrInstanceConfig, 0, len(in.ArrInstances)),
+		IgnoreExtensions:  make([]string, 0, len(in.IgnoreExtensions)),
+		MinSizeBytes:      in.MinSizeBytes,
 	}
 	if out.MinSizeBytes < 0 {
 		out.MinSizeBytes = 0
@@ -200,12 +203,13 @@ func normalizeSettings(in AppSettings) (AppSettings, error) {
 
 func cloneSettings(s AppSettings) AppSettings {
 	out := AppSettings{
-		ReadOnlyMode:     s.ReadOnlyMode,
-		Folders:          make([]FolderConfig, len(s.Folders)),
-		QbitInstances:    make([]QbitInstanceConfig, len(s.QbitInstances)),
-		ArrInstances:     make([]ArrInstanceConfig, len(s.ArrInstances)),
-		IgnoreExtensions: make([]string, len(s.IgnoreExtensions)),
-		MinSizeBytes:     s.MinSizeBytes,
+		ReadOnlyMode:      s.ReadOnlyMode,
+		ShowMediaMetadata: s.ShowMediaMetadata,
+		Folders:           make([]FolderConfig, len(s.Folders)),
+		QbitInstances:     make([]QbitInstanceConfig, len(s.QbitInstances)),
+		ArrInstances:      make([]ArrInstanceConfig, len(s.ArrInstances)),
+		IgnoreExtensions:  make([]string, len(s.IgnoreExtensions)),
+		MinSizeBytes:      s.MinSizeBytes,
 	}
 	copy(out.Folders, s.Folders)
 	copy(out.IgnoreExtensions, s.IgnoreExtensions)
@@ -246,7 +250,7 @@ func NewManager(configPath string) (*Manager, error) {
 func (m *Manager) loadOrInit() error {
 	data, err := os.ReadFile(m.configPath)
 	if err == nil {
-		var parsed AppSettings
+		parsed := defaultSettings()
 		if jErr := json.Unmarshal(data, &parsed); jErr == nil {
 			if norm, nErr := normalizeSettings(parsed); nErr == nil {
 				m.settings = norm
