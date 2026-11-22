@@ -1297,6 +1297,11 @@
       (payload.items || []).map((it) => String(it.torrent_hash || "").toLowerCase()).filter(Boolean)
     );
     const paths = new Set();
+    for (const it of payload.items || []) {
+      for (const ep of it.expected_paths || []) {
+        if (ep) paths.add(ep);
+      }
+    }
     for (const g of groups || []) {
       for (const t of g.torrents || []) {
         if (!deletedHashes.has(String(t.torrent_hash || "").toLowerCase())) continue;
@@ -1742,22 +1747,56 @@
     }
 
     if (actionType === "delete-torrents") {
-      const seen = new Set();
-      const items = [];
-      for (const g of groups) {
-        for (const t of g.torrents) {
-          const key = `${t.instance_id}::${t.torrent_hash}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          items.push({
-            instance_id: t.instance_id,
-            torrent_hash: t.torrent_hash,
-            torrent_name: t.torrent_name,
-            instance_name: t.instance_name,
-            expected_paths: t.matched_paths || [],
-          });
+      const byTorrent = new Map();
+      const addTorrentPaths = (entry, t) => {
+        if (t.match_type === "path" && t.mapped_path) {
+          entry.pathSet.add(t.mapped_path);
+        } else {
+          for (const mp of t.matched_paths || []) {
+            if (mp) entry.pathSet.add(mp);
+          }
+        }
+      };
+
+      for (const g of groups || []) {
+        for (const t of g.torrents || []) {
+          if (!t.instance_id || !t.torrent_hash) continue;
+          const key = `${t.instance_id}::${String(t.torrent_hash).toLowerCase()}`;
+          let entry = byTorrent.get(key);
+          if (!entry) {
+            entry = {
+              item: {
+                instance_id: t.instance_id,
+                torrent_hash: t.torrent_hash,
+                torrent_name: t.torrent_name,
+                instance_name: t.instance_name,
+                expected_paths: [],
+              },
+              pathSet: new Set(),
+            };
+            byTorrent.set(key, entry);
+          }
+          addTorrentPaths(entry, t);
         }
       }
+
+      if (state.scan && Array.isArray(state.scan.groups)) {
+        for (const g of state.scan.groups) {
+          for (const t of g.torrents || []) {
+            if (!t.instance_id || !t.torrent_hash) continue;
+            const key = `${t.instance_id}::${String(t.torrent_hash).toLowerCase()}`;
+            const entry = byTorrent.get(key);
+            if (entry) {
+              addTorrentPaths(entry, t);
+            }
+          }
+        }
+      }
+
+      const items = [...byTorrent.values()].map((entry) => {
+        entry.item.expected_paths = [...entry.pathSet];
+        return entry.item;
+      });
       return { items, delete_files: $("deleteTorrentFilesCheckbox").checked };
     }
 
@@ -2282,9 +2321,14 @@
         $("actionPreviewSummary").innerHTML =
           `<strong>${result.deleted_count}</strong> torrent(s) queued for removal${payload.delete_files ? " <strong>with data files</strong>" : " (keeping files on disk)"}. Estimated disk space freed: <strong>${formatBytes(result.bytes_reclaimed)}</strong>.`;
         $("actionPreviewList").innerHTML = [
-          ...payload.items.map(
-            (it) => `<div class="preview-row">[${escapeHtml(it.instance_name)}] ${escapeHtml(it.torrent_name)}<br><small>${escapeHtml((it.expected_paths || []).join(", "))}</small></div>`
-          ),
+          ...payload.items.map((it) => {
+            const paths = it.expected_paths || [];
+            const pathText =
+              paths.length > 3
+                ? `${paths.length} files: ${paths.slice(0, 3).join(", ")} (+${paths.length - 3} more)`
+                : paths.join(", ");
+            return `<div class="preview-row">[${escapeHtml(it.instance_name)}] ${escapeHtml(it.torrent_name)}<br><small>${escapeHtml(pathText)}</small></div>`;
+          }),
           ...result.errors.map((e) => `<div class="preview-row preview-err">${escapeHtml(e.error)}</div>`),
         ].join("") || `<div class="preview-row">No matching torrents found.</div>`;
         if (result.deleted_count === 0) {
