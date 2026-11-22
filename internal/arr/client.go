@@ -126,14 +126,16 @@ type radarrTitleItem struct {
 }
 
 type sonarrSeriesItem struct {
-	InstanceID   string
-	InstanceName string
-	SeriesID     int
-	Title        string
-	NormTitle    string
-	Year         int
-	Monitored    bool
-	RootPath     string
+	InstanceID    string
+	InstanceName  string
+	SeriesID      int
+	Title         string
+	NormTitle     string
+	BaseNormTitle string
+	TitleHasYear  bool
+	Year          int
+	Monitored     bool
+	RootPath      string
 }
 
 type wantedEpisodeKey struct {
@@ -326,6 +328,22 @@ func stripExt(filename string) string {
 	return filename
 }
 
+func splitTrailingYear(norm string) (base string, year int, ok bool) {
+	idx := strings.LastIndexByte(norm, ' ')
+	if idx <= 0 {
+		return norm, 0, false
+	}
+	tail := norm[idx+1:]
+	if len(tail) != 4 {
+		return norm, 0, false
+	}
+	y, err := strconv.Atoi(tail)
+	if err != nil || y < 1900 || y > 2099 {
+		return norm, 0, false
+	}
+	return norm[:idx], y, true
+}
+
 func (idx *Index) FindTitleMatches(filename, torrentName string) []ArrTitleMatch {
 	if idx == nil {
 		return nil
@@ -351,13 +369,22 @@ func (idx *Index) FindTitleMatches(filename, torrentName string) []ArrTitleMatch
 	seen := make(map[string]struct{})
 	out := make([]ArrTitleMatch, 0)
 
-	// 1. Radarr title + year matching
+	// 1. Radarr title + year matching (prefer exact title+year adjacency, then longest base title)
+	type radarrCandidateMatch struct {
+		item     radarrTitleItem
+		tier     int
+		titleLen int
+	}
+	radarrByInst := make(map[string]map[int]radarrCandidateMatch)
+	var radarrInstOrder []string
+
 	for _, m := range idx.RadarrTitles {
 		if m.Year <= 0 {
 			continue
 		}
 		yearStr := strconv.Itoa(m.Year)
-		matched := false
+		bestTier := 0
+		bestLen := 0
 		for _, nc := range normCandidates {
 			if !containsWordToken(nc, yearStr) {
 				continue
@@ -366,16 +393,51 @@ func (idx *Index) FindTitleMatches(filename, torrentName string) []ArrTitleMatch
 				if nt == "" {
 					continue
 				}
-				if nc == nt || strings.HasPrefix(nc, nt+" ") {
-					matched = true
-					break
+				tier := 0
+				if nc == nt+" "+yearStr || strings.HasPrefix(nc, nt+" "+yearStr+" ") {
+					tier = 2
+				} else if nc == nt || strings.HasPrefix(nc, nt+" ") {
+					tier = 1
+				}
+				if tier > bestTier || (tier == bestTier && tier > 0 && len(nt) > bestLen) {
+					bestTier = tier
+					bestLen = len(nt)
 				}
 			}
-			if matched {
-				break
+		}
+		if bestTier > 0 {
+			instMap, exists := radarrByInst[m.InstanceID]
+			if !exists {
+				instMap = make(map[int]radarrCandidateMatch)
+				radarrByInst[m.InstanceID] = instMap
+				radarrInstOrder = append(radarrInstOrder, m.InstanceID)
+			}
+			if prev, dup := instMap[m.ItemID]; !dup || bestTier > prev.tier || (bestTier == prev.tier && bestLen > prev.titleLen) {
+				instMap[m.ItemID] = radarrCandidateMatch{item: m, tier: bestTier, titleLen: bestLen}
 			}
 		}
-		if matched {
+	}
+
+	for _, instID := range radarrInstOrder {
+		instMap := radarrByInst[instID]
+		maxTier := 0
+		maxLenAtBest := 0
+		for _, cm := range instMap {
+			if cm.tier > maxTier {
+				maxTier = cm.tier
+				maxLenAtBest = cm.titleLen
+			} else if cm.tier == maxTier && cm.titleLen > maxLenAtBest {
+				maxLenAtBest = cm.titleLen
+			}
+		}
+		for _, cm := range instMap {
+			if cm.tier != maxTier {
+				continue
+			}
+			if maxTier == 1 && cm.titleLen < maxLenAtBest {
+				continue
+			}
+			m := cm.item
 			key := fmt.Sprintf("radarr:%s:%d", m.InstanceID, m.ItemID)
 			if _, ok := seen[key]; ok {
 				continue
@@ -397,19 +459,85 @@ func (idx *Index) FindTitleMatches(filename, torrentName string) []ArrTitleMatch
 		}
 	}
 
-	// 2. Sonarr SxxExx + series title matching against wanted/missing or existing episodes
+	// 2. Sonarr SxxExx + exact/year-aware series title matching
+	type sonarrScoredKey struct {
+		seriesID int
+		season   int
+		episode  int
+	}
+	type sonarrCandidateMatch struct {
+		sr      sonarrSeriesItem
+		season  int
+		episode int
+		tier    int
+	}
+	sonarrByInst := make(map[string]map[sonarrScoredKey]sonarrCandidateMatch)
+	var sonarrInstOrder []string
+
 	for _, raw := range candidates {
 		seasonNum, epNum, prefix, ok := extractSeasonEpisode(raw)
 		if !ok || prefix == "" {
 			continue
 		}
+		prefixBase, prefixYear, prefixHasYear := splitTrailingYear(prefix)
 		for _, sr := range idx.SonarrSeries {
 			if sr.NormTitle == "" {
 				continue
 			}
-			if prefix != sr.NormTitle && !strings.HasPrefix(prefix, sr.NormTitle+" ") {
+			tier := 0
+			switch {
+			case (prefix == sr.NormTitle && sr.TitleHasYear) ||
+				(prefixHasYear && sr.Year > 0 && prefixYear == sr.Year && prefixBase == sr.BaseNormTitle):
+				tier = 3
+			case prefix == sr.NormTitle:
+				tier = 2
+			case !prefixHasYear && sr.TitleHasYear && prefix == sr.BaseNormTitle:
+				tier = 1
+			}
+			if tier == 0 {
 				continue
 			}
+
+			instMap, exists := sonarrByInst[sr.InstanceID]
+			if !exists {
+				instMap = make(map[sonarrScoredKey]sonarrCandidateMatch)
+				sonarrByInst[sr.InstanceID] = instMap
+				sonarrInstOrder = append(sonarrInstOrder, sr.InstanceID)
+			}
+			sk := sonarrScoredKey{seriesID: sr.SeriesID, season: seasonNum, episode: epNum}
+			if prev, dup := instMap[sk]; !dup || tier > prev.tier {
+				instMap[sk] = sonarrCandidateMatch{sr: sr, season: seasonNum, episode: epNum, tier: tier}
+			}
+		}
+	}
+
+	for _, instID := range sonarrInstOrder {
+		instMap := sonarrByInst[instID]
+		maxTier := 0
+		for _, cm := range instMap {
+			if cm.tier > maxTier {
+				maxTier = cm.tier
+			}
+		}
+		if maxTier == 1 {
+			distinctSeries := make(map[int]struct{})
+			for _, cm := range instMap {
+				if cm.tier == 1 {
+					distinctSeries[cm.sr.SeriesID] = struct{}{}
+				}
+			}
+			if len(distinctSeries) > 1 {
+				continue
+			}
+		}
+
+		for _, cm := range instMap {
+			if cm.tier != maxTier {
+				continue
+			}
+			sr := cm.sr
+			seasonNum := cm.season
+			epNum := cm.episode
 			wk := wantedEpisodeKey{
 				InstanceID: sr.InstanceID,
 				SeriesID:   sr.SeriesID,
@@ -1018,15 +1146,30 @@ func sonarrSeriesToData(inst config.ArrInstanceConfig, s sonarrSeriesJSON) (ArrL
 		RemotePath:   qbit.NormalizeSlashPath(s.Path),
 		MappedPath:   mappedRoot,
 	}
+	normTitle := normalizeTitle(s.Title)
+	baseNormTitle := normTitle
+	titleHasYear := false
+	year := s.Year
+	if b, y, ok := splitTrailingYear(normTitle); ok {
+		if (s.Year > 0 && y == s.Year) || (s.Year == 0 && strings.HasSuffix(strings.TrimSpace(s.Title), fmt.Sprintf("(%d)", y))) {
+			baseNormTitle = b
+			titleHasYear = true
+			if year == 0 {
+				year = y
+			}
+		}
+	}
 	srItem := sonarrSeriesItem{
-		InstanceID:   inst.ID,
-		InstanceName: inst.Name,
-		SeriesID:     s.ID,
-		Title:        s.Title,
-		NormTitle:    normalizeTitle(s.Title),
-		Year:         s.Year,
-		Monitored:    s.Monitored,
-		RootPath:     mappedRoot,
+		InstanceID:    inst.ID,
+		InstanceName:  inst.Name,
+		SeriesID:      s.ID,
+		Title:         s.Title,
+		NormTitle:     normTitle,
+		BaseNormTitle: baseNormTitle,
+		TitleHasYear:  titleHasYear,
+		Year:          year,
+		Monitored:     s.Monitored,
+		RootPath:      mappedRoot,
 	}
 	return libEntry, srItem
 }

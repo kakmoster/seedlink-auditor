@@ -2635,3 +2635,137 @@ func TestQbitSwapRenameCollisionAndCommonSlashDir(t *testing.T) {
 		t.Fatalf("expected swapped file names in mock qBit, got SavePath=%q Files=%+v", mt.SavePath, mt.Files)
 	}
 }
+
+func TestArrSeriesAndMovieTitleYearDisambiguation(t *testing.T) {
+	root := t.TempDir()
+	plexDir := filepath.Join(root, "plex")
+	dlDir := filepath.Join(root, "downloads")
+	if err := os.MkdirAll(plexDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Disk files in Downloads (Folder B) to test Sonarr & Radarr title+year matching
+	fAvatar2024 := filepath.Join(dlDir, "tv", "Avatar.The.Last.Airbender.2024.S02E01.Somewhere.Safe.2160p.NF.WEB-DL.mkv")
+	fAvatar2005 := filepath.Join(dlDir, "tv", "Avatar.The.Last.Airbender.S02E01.The.Avatar.State.720p.mkv")
+	fDaryl := filepath.Join(dlDir, "tv", "The.Walking.Dead.Daryl.Dixon.S01E01.1080p.mkv")
+	fDoctorWho := filepath.Join(dlDir, "tv", "Doctor.Who.S05E01.1080p.mkv")
+	fLastOfUs := filepath.Join(dlDir, "tv", "The.Last.of.Us.2023.S01E01.1080p.mkv")
+	fFastX := filepath.Join(dlDir, "movies", "Fast.X.2023.2160p.mkv")
+
+	for i, p := range []string{fAvatar2024, fAvatar2005, fDaryl, fDoctorWho, fLastOfUs, fFastX} {
+		writeTestFile(t, p, makePayload("disambig-"+strconv.Itoa(i), 24*1024))
+	}
+
+	sonarrMock := newMockArrServer(t, "sonarr")
+	sonarrMock.series = []map[string]any{
+		{"id": 101, "title": "Avatar: The Last Airbender", "year": 2005, "path": "/media/tv/Avatar The Last Airbender", "monitored": true},
+		{"id": 102, "title": "Avatar: The Last Airbender (2024)", "year": 2024, "path": "/media/tv/Avatar The Last Airbender (2024)", "monitored": true},
+		{"id": 103, "title": "The Walking Dead", "year": 2010, "path": "/media/tv/The Walking Dead", "monitored": true},
+		{"id": 104, "title": "The Walking Dead: Daryl Dixon", "year": 2023, "path": "/media/tv/The Walking Dead Daryl Dixon", "monitored": true},
+		{"id": 105, "title": "Doctor Who (2005)", "year": 2005, "path": "/media/tv/Doctor Who (2005)", "monitored": true},
+		{"id": 106, "title": "The Last of Us", "year": 2023, "path": "/media/tv/The Last of Us", "monitored": true},
+	}
+	sonarrMock.episodeFiles["101"] = []map[string]any{
+		{
+			"id": 1011, "seriesId": 101, "seasonNumber": 2,
+			"path":         "/media/tv/Avatar The Last Airbender/Season 02/Avatar.The.Last.Airbender.S02E01.The.Avatar.State.mkv",
+			"relativePath": "Season 02/Avatar.The.Last.Airbender.S02E01.The.Avatar.State.mkv",
+			"size":         900001,
+		},
+	}
+	sonarrMock.episodeFiles["102"] = []map[string]any{
+		{
+			"id": 1021, "seriesId": 102, "seasonNumber": 2,
+			"path":         "/media/tv/Avatar The Last Airbender (2024)/Season 02/Avatar.The.Last.Airbender.2024.S02E01.Somewhere.Safe.DV.HDR.mkv",
+			"relativePath": "Season 02/Avatar.The.Last.Airbender.2024.S02E01.Somewhere.Safe.DV.HDR.mkv",
+			"size":         900002,
+		},
+	}
+	sonarrMock.episodeFiles["103"] = []map[string]any{
+		{
+			"id": 1031, "seriesId": 103, "seasonNumber": 1,
+			"path":         "/media/tv/The Walking Dead/Season 01/The.Walking.Dead.S01E01.mkv",
+			"relativePath": "Season 01/The.Walking.Dead.S01E01.mkv",
+			"size":         900003,
+		},
+	}
+	sonarrMock.wanted = []map[string]any{
+		{"id": 1041, "seriesId": 104, "seasonNumber": 1, "episodeNumber": 1, "title": "L'ame Perdue", "monitored": true, "hasFile": false},
+		{"id": 1051, "seriesId": 105, "seasonNumber": 5, "episodeNumber": 1, "title": "The Eleventh Hour", "monitored": true, "hasFile": false},
+		{"id": 1061, "seriesId": 106, "seasonNumber": 1, "episodeNumber": 1, "title": "When You're Lost in the Darkness", "monitored": true, "hasFile": false},
+	}
+
+	radarrMock := newMockArrServer(t, "radarr")
+	radarrMock.movies = []map[string]any{
+		{"id": 201, "title": "Fast", "year": 2023, "path": "/media/movies/Fast (2023)", "hasFile": false, "monitored": true},
+		{"id": 202, "title": "Fast X", "year": 2023, "path": "/media/movies/Fast X (2023)", "hasFile": false, "monitored": true},
+	}
+
+	cfgMgr, err := config.NewManager(filepath.Join(root, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = cfgMgr.Update(config.AppSettings{
+		ReadOnlyMode: true,
+		Folders: []config.FolderConfig{
+			{ID: "plex", Label: "Plex", Path: plexDir, Role: "primary"},
+			{ID: "dl", Label: "Downloads", Path: dlDir, Role: "secondary"},
+		},
+		ArrInstances: []config.ArrInstanceConfig{
+			{
+				ID: "son1", Name: "Sonarr", Type: "sonarr", URL: sonarrMock.server.URL, APIKey: "arr-secret-key", Enabled: true,
+				PathMappings: []config.PathMapping{{RemotePrefix: "/media", LocalPrefix: qbit.NormalizeSlashPath(plexDir)}},
+			},
+			{
+				ID: "rad1", Name: "Radarr", Type: "radarr", URL: radarrMock.server.URL, APIKey: "arr-secret-key", Enabled: true,
+				PathMappings: []config.PathMapping{{RemotePrefix: "/media", LocalPrefix: qbit.NormalizeSlashPath(plexDir)}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(server.New(cfgMgr, qbit.NewClient(5*time.Second), arr.NewClient(5*time.Second), nil))
+	t.Cleanup(ts.Close)
+
+	var scanRes scanner.ScanResult
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/scan", nil, &scanRes); c != http.StatusOK {
+		t.Fatalf("expected 200 on /api/scan, got %d", c)
+	}
+
+	byName := make(map[string]scanner.ComparisonGroup, len(scanRes.Groups))
+	for _, g := range scanRes.Groups {
+		byName[g.Filename] = g
+	}
+
+	g2024 := byName[filepath.Base(fAvatar2024)]
+	if len(g2024.ArrMatches) != 1 || g2024.ArrMatches[0].ItemID != 102 || g2024.ArrSummary != "REPLACED_IN_ARR" {
+		t.Fatalf("expected Avatar 2024 release to match ONLY ID 102, got %+v", g2024.ArrMatches)
+	}
+
+	g2005 := byName[filepath.Base(fAvatar2005)]
+	if len(g2005.ArrMatches) != 1 || g2005.ArrMatches[0].ItemID != 101 || g2005.ArrSummary != "REPLACED_IN_ARR" {
+		t.Fatalf("expected Avatar (2005) release to match ONLY ID 101, got %+v", g2005.ArrMatches)
+	}
+
+	gDaryl := byName[filepath.Base(fDaryl)]
+	if len(gDaryl.ArrMatches) != 1 || gDaryl.ArrMatches[0].ItemID != 104 || gDaryl.ArrSummary != "WANTED_NOT_IMPORTED" {
+		t.Fatalf("expected Walking Dead Daryl Dixon release to match ONLY ID 104, got %+v", gDaryl.ArrMatches)
+	}
+
+	gDoc := byName[filepath.Base(fDoctorWho)]
+	if len(gDoc.ArrMatches) != 1 || gDoc.ArrMatches[0].ItemID != 105 || gDoc.ArrSummary != "WANTED_NOT_IMPORTED" {
+		t.Fatalf("expected Doctor Who (no year in filename) to match unique ID 105, got %+v", gDoc.ArrMatches)
+	}
+
+	gLast := byName[filepath.Base(fLastOfUs)]
+	if len(gLast.ArrMatches) != 1 || gLast.ArrMatches[0].ItemID != 106 || gLast.ArrSummary != "WANTED_NOT_IMPORTED" {
+		t.Fatalf("expected The Last of Us 2023 to match ID 106, got %+v", gLast.ArrMatches)
+	}
+
+	gFastX := byName[filepath.Base(fFastX)]
+	if len(gFastX.ArrMatches) != 1 || gFastX.ArrMatches[0].ItemID != 202 || gFastX.ArrSummary != "WANTED_NOT_IMPORTED" {
+		t.Fatalf("expected Fast X 2023 to match ONLY ID 202 (not Fast 2023), got %+v", gFastX.ArrMatches)
+	}
+}
