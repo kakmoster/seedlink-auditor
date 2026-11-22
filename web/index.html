@@ -30,7 +30,7 @@
         </button>
 
         <button id="openSettingsBtn" class="btn btn-secondary" type="button">
-          Settings (Folders &amp; qBit)
+          Settings
         </button>
 
         <div class="export-group">
@@ -68,6 +68,12 @@
           <span class="strip-label">Radarr / Sonarr:</span>
           <div id="arrChips" class="chip-list">
             <span class="chip chip-muted">No instances configured</span>
+          </div>
+        </div>
+        <div class="strip-group">
+          <span class="strip-label">Plex:</span>
+          <div id="plexChips" class="chip-list">
+            <span class="chip chip-muted">No servers configured</span>
           </div>
         </div>
         <div class="strip-meta" id="scanMeta">Not scanned yet</div>
@@ -137,6 +143,7 @@
           <button class="tab-btn" data-tab="UNTRACKED" type="button">Untracked in qBit <span class="tab-count" id="tabCountUntracked">0</span></button>
           <button class="tab-btn" data-tab="TRACKER_ISSUE" type="button">Unregistered / Errors <span class="tab-count" id="tabCountTrackerIssue">0</span></button>
           <button class="tab-btn" data-tab="ARR_ISSUE" type="button">Fix in Radarr/Sonarr <span class="tab-count" id="tabCountArrIssue">0</span></button>
+          <button class="tab-btn" id="tabMissingPlex" data-tab="MISSING_IN_PLEX" type="button" hidden>Missing in Plex <span class="tab-count" id="tabCountMissingPlex">0</span></button>
           <button class="tab-btn" data-tab="ONLY_IN_A" type="button">Only in Folder A <span class="tab-count" id="tabCountOnlyA">0</span></button>
         </div>
 
@@ -165,6 +172,12 @@
               <option value="UNLINKED_IN_LIBRARY">Unlinked in Library</option>
               <option value="REPLACED_IN_ARR">Replaced / Upgraded</option>
               <option value="NOT_IN_ARR">Not in Arr</option>
+            </select>
+            <select id="plexFilter" class="input-control" hidden title="Filter by Plex library status">
+              <option value="ALL">All Plex States</option>
+              <option value="IN_PLEX">In Plex</option>
+              <option value="NOT_IN_PLEX">Missing in Plex</option>
+              <option value="OTHER_VERSION_IN_PLEX">Other Version in Plex</option>
             </select>
             <select id="folderFilter" class="input-control">
               <option value="ALL">All Folders</option>
@@ -228,7 +241,7 @@
                 <th class="col-file">File</th>
                 <th class="col-folders">Folders</th>
                 <th class="col-qbit">qBittorrent</th>
-                <th class="col-arr">Radarr / Sonarr</th>
+                <th class="col-arr" id="colArrHeader">Radarr / Sonarr</th>
                 <th class="col-reclaim">Reclaimable</th>
                 <th class="col-actions">Actions</th>
               </tr>
@@ -236,7 +249,7 @@
             <tbody id="auditTableBody">
               <tr>
                 <td colspan="7" class="empty-table-cell">
-                  No scan data yet. Open <strong>Settings (Folders &amp; qBit)</strong> to add your folders and click <strong>Scan Now</strong>.
+                  No scan data yet. Open <strong>Settings</strong> to add your folders and click <strong>Scan Now</strong>.
                 </td>
               </tr>
             </tbody>
@@ -282,6 +295,9 @@
         </button>
         <button class="settings-tab-btn" data-settings-tab="arr" type="button" role="tab">
           Radarr / Sonarr <span class="tab-count" id="settingsCountArr">0</span>
+        </button>
+        <button class="settings-tab-btn" data-settings-tab="plex" type="button" role="tab">
+          Plex <span class="tab-count" id="settingsCountPlex">0</span>
         </button>
         <button class="settings-tab-btn" data-settings-tab="filters" type="button" role="tab">
           Filters &amp; Display
@@ -329,6 +345,20 @@
           <div id="arrEditorList" class="editor-list"></div>
         </div>
 
+        <div class="settings-section" data-settings-panel="plex" hidden>
+          <div class="section-head">
+            <div>
+              <h3>Plex Media Servers</h3>
+              <p class="section-hint">
+                Connect Plex to check whether movies &amp; episodes exist in your Plex library, spot files missing from Plex, and fetch posters &amp; genres even for items removed from Radarr/Sonarr.
+                Find your <code>X-Plex-Token</code> in Plex Web via item Info &rarr; View XML.
+              </p>
+            </div>
+            <button id="addPlexBtn" class="btn btn-secondary btn-sm" type="button">+ Add Plex Server</button>
+          </div>
+          <div id="plexEditorList" class="editor-list"></div>
+        </div>
+
         <div class="settings-section" data-settings-panel="filters" hidden>
           <div class="section-head">
             <div>
@@ -351,13 +381,13 @@
             <div class="section-head">
               <div>
                 <h3>Display Preferences</h3>
-                <p class="section-hint">Choose whether artwork and genre tags from Radarr &amp; Sonarr appear in the audit view.</p>
+                <p class="section-hint">Choose whether artwork and genre tags from Radarr, Sonarr &amp; Plex appear in the audit view.</p>
               </div>
             </div>
             <label class="toggle-setting-row">
               <input type="checkbox" id="showMediaMetadataCheckbox" checked />
               <span>
-                <strong>Show movie / series posters &amp; genres from Radarr / Sonarr</strong>
+                <strong>Show movie / series posters &amp; genres from Radarr / Sonarr &amp; Plex</strong>
                 <small>Displays mini poster thumbnails (with hover zoom &amp; detail artwork), genre pills, and the Genre filter bar.</small>
               </span>
             </label>

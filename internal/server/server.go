@@ -21,6 +21,7 @@ import (
 	"seedlink-auditor/internal/actions"
 	"seedlink-auditor/internal/arr"
 	"seedlink-auditor/internal/config"
+	"seedlink-auditor/internal/plex"
 	"seedlink-auditor/internal/qbit"
 	"seedlink-auditor/internal/scanner"
 )
@@ -29,22 +30,27 @@ type Server struct {
 	cfgMgr     *config.Manager
 	qbitClient *qbit.Client
 	arrClient  *arr.Client
+	plexClient *plex.Client
 	webFS      fs.FS
 	mux        *http.ServeMux
 
-	scanMu     sync.RWMutex
-	lastScan   *scanner.ScanResult
-	posterMeta map[string]arr.PosterInfo
+	scanMu         sync.RWMutex
+	lastScan       *scanner.ScanResult
+	lastPlexIdx    *plex.Index
+	posterMeta     map[string]arr.PosterInfo
+	plexPosterMeta map[string]string
 }
 
 func New(cfgMgr *config.Manager, qbitClient *qbit.Client, arrClient *arr.Client, webFS fs.FS) *Server {
 	s := &Server{
-		cfgMgr:     cfgMgr,
-		qbitClient: qbitClient,
-		arrClient:  arrClient,
-		webFS:      webFS,
-		mux:        http.NewServeMux(),
-		posterMeta: make(map[string]arr.PosterInfo),
+		cfgMgr:         cfgMgr,
+		qbitClient:     qbitClient,
+		arrClient:      arrClient,
+		plexClient:     plex.NewClient(20 * time.Second),
+		webFS:          webFS,
+		mux:            http.NewServeMux(),
+		posterMeta:     make(map[string]arr.PosterInfo),
+		plexPosterMeta: make(map[string]string),
 	}
 	s.registerRoutes()
 	return s
@@ -61,6 +67,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("PATCH /api/config/read-only", s.handleToggleReadOnly)
 	s.mux.HandleFunc("POST /api/qbit/test", s.handleTestQbit)
 	s.mux.HandleFunc("POST /api/arr/test", s.handleTestArr)
+	s.mux.HandleFunc("POST /api/plex/test", s.handleTestPlex)
 	s.mux.HandleFunc("GET /api/fs/browse", s.handleBrowseFS)
 	s.mux.HandleFunc("POST /api/scan", s.handleScan)
 	s.mux.HandleFunc("POST /api/scan/refresh-groups", s.handleRefreshGroups)
@@ -73,6 +80,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/actions/qbit-relocate", s.handleQbitRelocate)
 	s.mux.HandleFunc("POST /api/arr/commands/status", s.handleArrCommandsStatus)
 	s.mux.HandleFunc("GET /api/arr/poster", s.handleArrPoster)
+	s.mux.HandleFunc("GET /api/plex/poster", s.handlePlexPoster)
 	s.mux.HandleFunc("GET /api/export", s.handleExport)
 
 	if s.webFS != nil {
@@ -170,6 +178,16 @@ func (s *Server) handleTestArr(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+func (s *Server) handleTestPlex(w http.ResponseWriter, r *http.Request) {
+	var inst config.PlexInstanceConfig
+	if err := decodeJSONBody(w, r, &inst); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid JSON payload: %v", err))
+		return
+	}
+	res := s.plexClient.TestConnection(r.Context(), inst)
+	writeJSON(w, http.StatusOK, res)
+}
+
 type dirEntryDTO struct {
 	Name string `json:"name"`
 	Path string `json:"path"`
@@ -258,9 +276,10 @@ func (s *Server) runAndStoreScan(r *http.Request) scanner.ScanResult {
 	var scanned scanner.ScannedFolders
 	var qbitIdx *qbit.Index
 	var arrIdx *arr.Index
+	var plexIdx *plex.Index
 
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 	go func() {
 		defer wg.Done()
 		scanned = scanner.ScanFolders(settings)
@@ -277,13 +296,20 @@ func (s *Server) runAndStoreScan(r *http.Request) scanner.ScanResult {
 			arrIdx = s.arrClient.BuildIndex(r.Context(), settings.ArrInstances)
 		}
 	}()
+	go func() {
+		defer wg.Done()
+		if s.plexClient != nil {
+			plexIdx = s.plexClient.BuildIndex(r.Context(), settings.PlexInstances)
+		}
+	}()
 	wg.Wait()
 
-	result := scanner.CompareScanned(settings, scanned, qbitIdx, arrIdx, start)
+	result := scanner.CompareScanned(settings, scanned, qbitIdx, arrIdx, plexIdx, start)
 
 	s.scanMu.Lock()
 	copied := result
 	s.lastScan = &copied
+	s.lastPlexIdx = plexIdx
 	nextPosters := make(map[string]arr.PosterInfo)
 	if arrIdx != nil {
 		for k, v := range arrIdx.PosterMeta {
@@ -291,6 +317,13 @@ func (s *Server) runAndStoreScan(r *http.Request) scanner.ScanResult {
 		}
 	}
 	s.posterMeta = nextPosters
+	nextPlexPosters := make(map[string]string)
+	if plexIdx != nil {
+		for k, v := range plexIdx.PosterMeta {
+			nextPlexPosters[k] = v
+		}
+	}
+	s.plexPosterMeta = nextPlexPosters
 	s.scanMu.Unlock()
 
 	return result
@@ -381,6 +414,7 @@ func (s *Server) handleRefreshGroups(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	currentSummary := s.lastScan.Summary
+	plexIdx := s.lastPlexIdx
 	s.scanMu.RUnlock()
 
 	if len(prevTargets) == 0 {
@@ -456,13 +490,23 @@ func (s *Server) handleRefreshGroups(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	plexHadError := false
+	if plexIdx != nil {
+		for _, rep := range plexIdx.Instances {
+			if !rep.OK && rep.Error != nil && *rep.Error != "Disabled" {
+				plexHadError = true
+				break
+			}
+		}
+	}
+
 	updatedGroups := make([]scanner.ComparisonGroup, 0, len(prevTargets))
 	removedGroupIDs := make([]string, 0)
 	updatedByID := make(map[string]scanner.ComparisonGroup, len(prevTargets))
 	removedSet := make(map[string]struct{}, len(prevTargets))
 
 	for _, prev := range prevTargets {
-		updated, alive := scanner.RefreshSingleGroup(settings, prev, qbitIdx, arrIdx, discoveredArrPaths)
+		updated, alive := scanner.RefreshSingleGroup(settings, prev, qbitIdx, arrIdx, plexIdx, discoveredArrPaths)
 		if !alive {
 			removedGroupIDs = append(removedGroupIDs, prev.ID)
 			removedSet[prev.ID] = struct{}{}
@@ -472,6 +516,10 @@ func (s *Server) handleRefreshGroups(w http.ResponseWriter, r *http.Request) {
 			updated.ArrSummary = prev.ArrSummary
 			updated.HasArrIssue = prev.HasArrIssue
 			updated.ArrMatches = prev.ArrMatches
+		}
+		if (plexIdx == nil || plexHadError) && prev.PlexSummary != "" && prev.PlexSummary != "UNCONFIGURED" {
+			updated.PlexSummary = prev.PlexSummary
+			updated.PlexMatches = prev.PlexMatches
 		}
 		updatedGroups = append(updatedGroups, updated)
 		updatedByID[prev.ID] = updated
@@ -842,6 +890,56 @@ func (s *Server) handleArrPoster(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+func (s *Server) handlePlexPoster(w http.ResponseWriter, r *http.Request) {
+	instID := strings.TrimSpace(r.URL.Query().Get("instance_id"))
+	ratingKey := strings.TrimSpace(r.URL.Query().Get("rating_key"))
+	if instID == "" || ratingKey == "" {
+		writeError(w, http.StatusBadRequest, "Missing instance_id or rating_key")
+		return
+	}
+	if !plex.IsSafeRatingKey(ratingKey) {
+		writeError(w, http.StatusBadRequest, "Invalid rating_key")
+		return
+	}
+	if s.plexClient == nil {
+		writeError(w, http.StatusNotFound, "Plex client unavailable")
+		return
+	}
+
+	settings := s.cfgMgr.Get()
+	var targetInst config.PlexInstanceConfig
+	found := false
+	for _, inst := range settings.PlexInstances {
+		if inst.ID == instID && inst.Enabled {
+			targetInst = inst
+			found = true
+			break
+		}
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "Unknown or disabled Plex server")
+		return
+	}
+
+	s.scanMu.RLock()
+	var thumbPath string
+	if s.plexPosterMeta != nil {
+		thumbPath = s.plexPosterMeta[fmt.Sprintf("%s:%s", targetInst.ID, ratingKey)]
+	}
+	s.scanMu.RUnlock()
+
+	data, contentType, err := s.plexClient.FetchPoster(r.Context(), targetInst, ratingKey, thumbPath)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "Poster not found")
+		return
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
 	if format == "" {
@@ -887,6 +985,8 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		"Trackers",
 		"ArrSummary",
 		"ArrMatches",
+		"PlexSummary",
+		"PlexMatches",
 	})
 
 	for _, grp := range scanRes.Groups {
@@ -930,6 +1030,11 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 			arrDescs = append(arrDescs, fmt.Sprintf("%s (%s): %s [%s]", m.InstanceName, m.AppType, m.Title, m.MatchKind))
 		}
 
+		plexDescs := make([]string, 0, len(grp.PlexMatches))
+		for _, m := range grp.PlexMatches {
+			plexDescs = append(plexDescs, fmt.Sprintf("%s (%s): %s [%s]", m.InstanceName, m.LibraryTitle, m.Title, m.MatchKind))
+		}
+
 		_ = cw.Write([]string{
 			grp.Status,
 			grp.Filename,
@@ -948,6 +1053,8 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 			strings.Join(trackers, " | "),
 			grp.ArrSummary,
 			strings.Join(arrDescs, " | "),
+			grp.PlexSummary,
+			strings.Join(plexDescs, " | "),
 		})
 	}
 	cw.Flush()

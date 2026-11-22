@@ -20,6 +20,7 @@ import (
 	"seedlink-auditor/internal/actions"
 	"seedlink-auditor/internal/arr"
 	"seedlink-auditor/internal/config"
+	"seedlink-auditor/internal/plex"
 	"seedlink-auditor/internal/qbit"
 	"seedlink-auditor/internal/scanner"
 	"seedlink-auditor/internal/server"
@@ -3131,4 +3132,456 @@ func TestArrPostersGenresAndDisplaySetting(t *testing.T) {
 		}
 	}
 }
+
+type mockPlexServer struct {
+	mu               sync.Mutex
+	server           *httptest.Server
+	friendlyName     string
+	version          string
+	sections         []map[string]any
+	moviesBySec      map[string][]map[string]any
+	showsBySec       map[string][]map[string]any
+	episodesBySec    map[string][]map[string]any
+	transcodePosters map[string][]byte
+	directPosters    map[string][]byte
+}
+
+func newMockPlexServer(t *testing.T) *mockPlexServer {
+	t.Helper()
+	mp := &mockPlexServer{
+		friendlyName:     "Home Plex",
+		version:          "1.41.0",
+		moviesBySec:      make(map[string][]map[string]any),
+		showsBySec:       make(map[string][]map[string]any),
+		episodesBySec:    make(map[string][]map[string]any),
+		transcodePosters: make(map[string][]byte),
+		directPosters:    make(map[string][]byte),
+	}
+
+	requireToken := func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Header.Get("X-Plex-Token") != "plex-secret-token" {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return false
+		}
+		return true
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		if !requireToken(w, r) {
+			return
+		}
+		mp.mu.Lock()
+		defer mp.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"MediaContainer": map[string]any{
+				"friendlyName": mp.friendlyName,
+				"version":      mp.version,
+			},
+		})
+	})
+
+	mux.HandleFunc("GET /library/sections", func(w http.ResponseWriter, r *http.Request) {
+		if !requireToken(w, r) {
+			return
+		}
+		mp.mu.Lock()
+		defer mp.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"MediaContainer": map[string]any{
+				"Directory": mp.sections,
+			},
+		})
+	})
+
+	mux.HandleFunc("GET /library/sections/{key}/all", func(w http.ResponseWriter, r *http.Request) {
+		if !requireToken(w, r) {
+			return
+		}
+		secKey := r.PathValue("key")
+		plexType := r.URL.Query().Get("type")
+		sizeParam := r.URL.Query().Get("X-Plex-Container-Size")
+
+		mp.mu.Lock()
+		var items []map[string]any
+		switch plexType {
+		case "1":
+			items = mp.moviesBySec[secKey]
+		case "2":
+			items = mp.showsBySec[secKey]
+		case "4":
+			items = mp.episodesBySec[secKey]
+		}
+		mp.mu.Unlock()
+
+		if sizeParam == "0" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"MediaContainer": map[string]any{
+					"size":      0,
+					"totalSize": len(items),
+					"Metadata":  []map[string]any{},
+				},
+			})
+			return
+		}
+		if items == nil {
+			items = []map[string]any{}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"MediaContainer": map[string]any{
+				"size":      len(items),
+				"totalSize": len(items),
+				"Metadata":  items,
+			},
+		})
+	})
+
+	mux.HandleFunc("GET /photo/:/transcode", func(w http.ResponseWriter, r *http.Request) {
+		if !requireToken(w, r) {
+			return
+		}
+		thumbURL := r.URL.Query().Get("url")
+		mp.mu.Lock()
+		img := mp.transcodePosters[thumbURL]
+		mp.mu.Unlock()
+		if len(img) == 0 {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(img)
+	})
+
+	mux.HandleFunc("GET /library/metadata/{id}/thumb/{ts}", func(w http.ResponseWriter, r *http.Request) {
+		if !requireToken(w, r) {
+			return
+		}
+		idVal := r.PathValue("id")
+		mp.mu.Lock()
+		img := mp.directPosters[idVal]
+		mp.mu.Unlock()
+		if len(img) == 0 {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(img)
+	})
+
+	mux.HandleFunc("GET /library/metadata/{id}/thumb", func(w http.ResponseWriter, r *http.Request) {
+		if !requireToken(w, r) {
+			return
+		}
+		idVal := r.PathValue("id")
+		mp.mu.Lock()
+		img := mp.directPosters[idVal]
+		mp.mu.Unlock()
+		if len(img) == 0 {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(img)
+	})
+
+	mp.server = httptest.NewServer(mux)
+	t.Cleanup(mp.server.Close)
+	return mp
+}
+
+func TestPlexIntegrationPostersGenresAndMissingStatus(t *testing.T) {
+	root := t.TempDir()
+	plexDir := filepath.Join(root, "plex")
+	dlDir := filepath.Join(root, "downloads")
+
+	// Files covering IN_PLEX, OTHER_VERSION_IN_PLEX, series_missing_episode (NOT_IN_PLEX), remake disambig, and unindexed.
+	fIncPlex := filepath.Join(plexDir, "movies", "Inception (2010)", "Inception (2010).mkv")
+	fIncOther := filepath.Join(dlDir, "movies", "Inception.2010.720p.mkv")
+	fSevPlex := filepath.Join(plexDir, "tv", "Severance", "Season 01", "Severance.S01E01.mkv")
+	fSevOther := filepath.Join(dlDir, "tv", "Severance.S01E01.720p.mkv")
+	fSevMissing := filepath.Join(dlDir, "tv", "Severance.S01E02.1080p.mkv")
+	fAvatar2024 := filepath.Join(dlDir, "tv", "Avatar.The.Last.Airbender.2024.S01E01.mkv")
+	fFastX := filepath.Join(dlDir, "movies", "Fast.X.2023.1080p.mkv")
+	fUnknown := filepath.Join(dlDir, "movies", "Totally.Unknown.Movie.2025.mkv")
+
+	incSize := 32 * 1024
+	sevSize := 28 * 1024
+	writeTestFile(t, fIncPlex, makePayload("plex-inc", incSize))
+	writeTestFile(t, fIncOther, makePayload("plex-inc-other", 20*1024))
+	writeTestFile(t, fSevPlex, makePayload("plex-sev-1", sevSize))
+	writeTestFile(t, fSevOther, makePayload("plex-sev-1-other", 18*1024))
+	writeTestFile(t, fSevMissing, makePayload("plex-sev-2", 22*1024))
+	writeTestFile(t, fAvatar2024, makePayload("plex-av24", 24*1024))
+	writeTestFile(t, fFastX, makePayload("plex-fastx", 25*1024))
+	writeTestFile(t, fUnknown, makePayload("plex-unknown", 19*1024))
+
+	moviePosterPNG := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 'P', 'M', 'O', 'V'}
+	showDirectPNG := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 'P', 'S', 'H', 'W'}
+
+	mp := newMockPlexServer(t)
+	mp.sections = []map[string]any{
+		{"key": "1", "type": "movie", "title": "Movies"},
+		{"key": "2", "type": "show", "title": "TV Shows"},
+		{"key": "3", "type": "artist", "title": "Music"},
+	}
+	mp.moviesBySec["1"] = []map[string]any{
+		{
+			"ratingKey": "101",
+			"title":     "Inception",
+			"year":      2010,
+			"thumb":     "/library/metadata/101/thumb/111",
+			"Genre":     []map[string]any{{"tag": "Sci-Fi"}, {"tag": "Thriller"}},
+			"Media": []map[string]any{
+				{"Part": []map[string]any{{"file": "/plex_media/movies/Inception (2010)/Inception (2010).mkv", "size": incSize}}},
+			},
+		},
+		{
+			"ratingKey": "301",
+			"title":     "Fast",
+			"year":      2023,
+			"thumb":     "/library/metadata/301/thumb/111",
+			"Genre":     []map[string]any{{"tag": "Thriller"}},
+			"Media": []map[string]any{
+				{"Part": []map[string]any{{"file": "/plex_media/movies/Fast (2023)/Fast (2023).mkv", "size": 900001}}},
+			},
+		},
+		{
+			"ratingKey": "302",
+			"title":     "Fast X",
+			"year":      2023,
+			"thumb":     "/library/metadata/302/thumb/111",
+			"Genre":     []map[string]any{{"tag": "Action"}},
+			"Media": []map[string]any{
+				{"Part": []map[string]any{{"file": "/plex_media/movies/Fast X (2023)/Fast X (2023).mkv", "size": 900002}}},
+			},
+		},
+	}
+	mp.showsBySec["2"] = []map[string]any{
+		{
+			"ratingKey": "200",
+			"title":     "Severance",
+			"year":      2022,
+			"thumb":     "/library/metadata/200/thumb/222",
+			"Genre":     []map[string]any{{"tag": "Drama"}, {"tag": "Mystery"}},
+		},
+		{
+			"ratingKey": "201",
+			"title":     "Avatar: The Last Airbender",
+			"year":      2005,
+			"thumb":     "/library/metadata/201/thumb/222",
+			"Genre":     []map[string]any{{"tag": "Animation"}},
+		},
+		{
+			"ratingKey": "202",
+			"title":     "Avatar: The Last Airbender (2024)",
+			"year":      2024,
+			"thumb":     "/library/metadata/202/thumb/222",
+			"Genre":     []map[string]any{{"tag": "Action"}, {"tag": "Adventure"}},
+		},
+	}
+	mp.episodesBySec["2"] = []map[string]any{
+		{
+			"ratingKey":            "2001",
+			"grandparentRatingKey": "200",
+			"grandparentTitle":     "Severance",
+			"parentIndex":          1,
+			"index":                1,
+			"Media": []map[string]any{
+				{"Part": []map[string]any{{"file": "/plex_media/tv/Severance/Season 01/Severance.S01E01.mkv", "size": sevSize}}},
+			},
+		},
+		{
+			"ratingKey":            "2011",
+			"grandparentRatingKey": "201",
+			"grandparentTitle":     "Avatar: The Last Airbender",
+			"parentIndex":          1,
+			"index":                1,
+			"Media": []map[string]any{
+				{"Part": []map[string]any{{"file": "/plex_media/tv/Avatar 2005/Season 01/Avatar.2005.S01E01.mkv", "size": 900003}}},
+			},
+		},
+		{
+			"ratingKey":            "2021",
+			"grandparentRatingKey": "202",
+			"grandparentTitle":     "Avatar: The Last Airbender (2024)",
+			"parentIndex":          1,
+			"index":                1,
+			"Media": []map[string]any{
+				{"Part": []map[string]any{{"file": "/plex_media/tv/Avatar 2024/Season 01/Avatar.2024.S01E01.mkv", "size": 900004}}},
+			},
+		},
+	}
+	// Item 101 uses /photo/:/transcode; Item 200 leaves transcode 404 to verify direct thumb fallback.
+	mp.transcodePosters["/library/metadata/101/thumb/111"] = moviePosterPNG
+	mp.directPosters["200"] = showDirectPNG
+
+	cfgMgr, err := config.NewManager(filepath.Join(root, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(server.New(cfgMgr, qbit.NewClient(5*time.Second), arr.NewClient(5*time.Second), nil))
+	t.Cleanup(ts.Close)
+
+	// 1. POST /api/plex/test (valid & invalid token)
+	var testOK plex.TestResult
+	code := apiDoJSON(t, ts, http.MethodPost, "/api/plex/test", config.PlexInstanceConfig{
+		ID: "plex1", Name: "Plex", URL: mp.server.URL, Token: "plex-secret-token", Enabled: true,
+	}, &testOK)
+	if code != http.StatusOK || !testOK.OK || testOK.ServerName != "Home Plex" || testOK.Version != "1.41.0" || testOK.LibraryCount != 2 || testOK.ItemCount != 6 {
+		t.Fatalf("unexpected /api/plex/test valid response: code=%d res=%+v", code, testOK)
+	}
+
+	var testBad plex.TestResult
+	code = apiDoJSON(t, ts, http.MethodPost, "/api/plex/test", config.PlexInstanceConfig{
+		ID: "plex1", Name: "Plex", URL: mp.server.URL, Token: "wrong-token", Enabled: true,
+	}, &testBad)
+	if code != http.StatusOK || testBad.OK {
+		t.Fatalf("expected failed /api/plex/test on invalid token, got code=%d res=%+v", code, testBad)
+	}
+
+	// 2. PUT /api/config & GET /api/config round-trip (NO Arr instances configured)
+	updateCfg := config.AppSettings{
+		ReadOnlyMode:      true,
+		ShowMediaMetadata: true,
+		Folders: []config.FolderConfig{
+			{ID: "plex", Label: "Plex", Path: plexDir, Role: "primary"},
+			{ID: "dl", Label: "Downloads", Path: dlDir, Role: "secondary"},
+		},
+		PlexInstances: []config.PlexInstanceConfig{
+			{
+				ID:      "plex1",
+				Name:    "Home Plex",
+				URL:     mp.server.URL,
+				Token:   "plex-secret-token",
+				Enabled: true,
+				PathMappings: []config.PathMapping{
+					{RemotePrefix: "/plex_media", LocalPrefix: qbit.NormalizeSlashPath(plexDir)},
+				},
+			},
+		},
+	}
+	var savedCfg config.AppSettings
+	if c := apiDoJSON(t, ts, http.MethodPut, "/api/config", updateCfg, &savedCfg); c != http.StatusOK || len(savedCfg.PlexInstances) != 1 {
+		t.Fatalf("PUT /api/config failed: code=%d saved=%+v", c, savedCfg)
+	}
+	var gotCfg config.AppSettings
+	if c := apiDoJSON(t, ts, http.MethodGet, "/api/config", nil, &gotCfg); c != http.StatusOK || len(gotCfg.PlexInstances) != 1 || gotCfg.PlexInstances[0].ID != "plex1" {
+		t.Fatalf("GET /api/config failed: code=%d got=%+v", c, gotCfg)
+	}
+
+	// 3. POST /api/scan
+	var scanRes scanner.ScanResult
+	if c := apiDoJSON(t, ts, http.MethodPost, "/api/scan", nil, &scanRes); c != http.StatusOK {
+		t.Fatalf("POST /api/scan returned %d", c)
+	}
+	if scanRes.Summary.PlexInLibraryCount != 2 || scanRes.Summary.PlexOtherVersionCount != 4 || scanRes.Summary.PlexMissingCount != 2 {
+		t.Fatalf("unexpected Plex summary counts: %+v", scanRes.Summary)
+	}
+
+	byName := make(map[string]scanner.ComparisonGroup, len(scanRes.Groups))
+	for _, g := range scanRes.Groups {
+		byName[g.Filename] = g
+	}
+
+	gInc := byName[filepath.Base(fIncPlex)]
+	if gInc.ArrSummary != "UNCONFIGURED" || gInc.PlexSummary != "IN_PLEX" || len(gInc.PlexMatches) != 1 ||
+		gInc.PlexMatches[0].RatingKey != "101" || !gInc.PlexMatches[0].HasPoster || len(gInc.PlexMatches[0].Genres) != 2 {
+		t.Fatalf("unexpected Plex match for Inception: %+v", gInc)
+	}
+
+	gIncOther := byName[filepath.Base(fIncOther)]
+	if gIncOther.PlexSummary != "OTHER_VERSION_IN_PLEX" || len(gIncOther.PlexMatches) != 1 ||
+		gIncOther.PlexMatches[0].ExistingFileName != "Inception (2010).mkv" || !gIncOther.PlexMatches[0].HasPoster {
+		t.Fatalf("unexpected Plex match for Inception other version: %+v", gIncOther)
+	}
+
+	gSev := byName[filepath.Base(fSevPlex)]
+	if gSev.PlexSummary != "IN_PLEX" || len(gSev.PlexMatches) != 1 ||
+		gSev.PlexMatches[0].RatingKey != "200" || gSev.PlexMatches[0].EpisodeKey != "2001" ||
+		!gSev.PlexMatches[0].HasPoster || len(gSev.PlexMatches[0].Genres) != 2 {
+		t.Fatalf("expected Severance episode to carry show RatingKey 200 and show genres/poster, got %+v", gSev)
+	}
+
+	gSevOther := byName[filepath.Base(fSevOther)]
+	if gSevOther.PlexSummary != "OTHER_VERSION_IN_PLEX" || len(gSevOther.PlexMatches) != 1 ||
+		gSevOther.PlexMatches[0].ExistingFileName != "Severance.S01E01.mkv" {
+		t.Fatalf("unexpected Plex match for Severance S01E01 other version: %+v", gSevOther)
+	}
+
+	gSevMissing := byName[filepath.Base(fSevMissing)]
+	if gSevMissing.PlexSummary != "NOT_IN_PLEX" || len(gSevMissing.PlexMatches) != 1 ||
+		gSevMissing.PlexMatches[0].MatchKind != "series_missing_episode" ||
+		!gSevMissing.PlexMatches[0].HasPoster || len(gSevMissing.PlexMatches[0].Genres) != 2 {
+		t.Fatalf("expected Severance S01E02 to be NOT_IN_PLEX with series_missing_episode + show poster/genres, got %+v", gSevMissing)
+	}
+
+	gAv24 := byName[filepath.Base(fAvatar2024)]
+	if gAv24.PlexSummary != "OTHER_VERSION_IN_PLEX" || len(gAv24.PlexMatches) != 1 || gAv24.PlexMatches[0].RatingKey != "202" {
+		t.Fatalf("expected Avatar 2024 to match ONLY ratingKey 202, got %+v", gAv24.PlexMatches)
+	}
+
+	gFastX := byName[filepath.Base(fFastX)]
+	if gFastX.PlexSummary != "OTHER_VERSION_IN_PLEX" || len(gFastX.PlexMatches) != 1 || gFastX.PlexMatches[0].RatingKey != "302" {
+		t.Fatalf("expected Fast X 2023 to match ONLY ratingKey 302, got %+v", gFastX.PlexMatches)
+	}
+
+	gUnknown := byName[filepath.Base(fUnknown)]
+	if gUnknown.PlexSummary != "NOT_IN_PLEX" || len(gUnknown.PlexMatches) != 0 {
+		t.Fatalf("expected unindexed movie to be NOT_IN_PLEX with empty PlexMatches, got %+v", gUnknown)
+	}
+
+	// 4. GET /api/plex/poster (transcode hit, direct thumb fallback, 404, 400 + path traversal rejection)
+	fetchPlexPoster := func(query string) (int, http.Header, []byte) {
+		t.Helper()
+		resp, err := http.Get(ts.URL + "/api/plex/poster" + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, resp.Header, body
+	}
+
+	pCode, pHdr, pBody := fetchPlexPoster("?instance_id=plex1&rating_key=101")
+	if pCode != http.StatusOK || !strings.HasPrefix(pHdr.Get("Content-Type"), "image/png") ||
+		!strings.Contains(pHdr.Get("Cache-Control"), "max-age") || !bytes.Equal(pBody, moviePosterPNG) {
+		t.Fatalf("unexpected transcoded Plex poster response: code=%d ct=%q cc=%q len=%d", pCode, pHdr.Get("Content-Type"), pHdr.Get("Cache-Control"), len(pBody))
+	}
+
+	pCode, pHdr, pBody = fetchPlexPoster("?instance_id=plex1&rating_key=200")
+	if pCode != http.StatusOK || !strings.HasPrefix(pHdr.Get("Content-Type"), "image/png") || !bytes.Equal(pBody, showDirectPNG) {
+		t.Fatalf("unexpected direct thumb fallback Plex poster response: code=%d ct=%q len=%d", pCode, pHdr.Get("Content-Type"), len(pBody))
+	}
+
+	if pCode, _, _ = fetchPlexPoster("?instance_id=unknown&rating_key=101"); pCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown Plex instance_id, got %d", pCode)
+	}
+	if pCode, _, _ = fetchPlexPoster("?instance_id=plex1&rating_key=9999"); pCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing Plex poster, got %d", pCode)
+	}
+	for _, bad := range []string{"?instance_id=plex1", "?rating_key=101", "?instance_id=plex1&rating_key=../secret"} {
+		if pCode, _, _ = fetchPlexPoster(bad); pCode != http.StatusBadRequest {
+			t.Fatalf("expected 400 for query %q, got %d", bad, pCode)
+		}
+	}
+
+	// 5. Verify CSV export includes PlexSummary & PlexMatches headers
+	csvResp, err := http.Get(ts.URL + "/api/export?format=csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer csvResp.Body.Close()
+	records, err := csv.NewReader(csvResp.Body).ReadAll()
+	if err != nil || len(records) < 2 {
+		t.Fatalf("failed reading CSV export: err=%v rows=%d", err, len(records))
+	}
+	hdrRow := strings.Join(records[0], ",")
+	if !strings.Contains(hdrRow, "PlexSummary") || !strings.Contains(hdrRow, "PlexMatches") {
+		t.Fatalf("expected CSV header to contain PlexSummary and PlexMatches, got %v", records[0])
+	}
+}
+
 

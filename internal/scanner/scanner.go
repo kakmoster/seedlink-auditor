@@ -15,6 +15,7 @@ import (
 
 	"seedlink-auditor/internal/arr"
 	"seedlink-auditor/internal/config"
+	"seedlink-auditor/internal/plex"
 	"seedlink-auditor/internal/qbit"
 )
 
@@ -99,29 +100,51 @@ type ArrReference struct {
 	CanRescan        bool     `json:"can_rescan"`
 }
 
+type PlexReference struct {
+	InstanceID       string   `json:"instance_id"`
+	InstanceName     string   `json:"instance_name"`
+	LibraryTitle     string   `json:"library_title,omitempty"`
+	MediaType        string   `json:"media_type"` // "movie" or "show"
+	RatingKey        string   `json:"rating_key"`
+	EpisodeKey       string   `json:"episode_key,omitempty"`
+	Title            string   `json:"title"`
+	Year             int      `json:"year,omitempty"`
+	SeasonNumber     int      `json:"season_number,omitempty"`
+	EpisodeNumber    int      `json:"episode_number,omitempty"`
+	MatchKind        string   `json:"match_kind"` // "in_plex", "other_version", "series_missing_episode"
+	StatusMessage    string   `json:"status_message,omitempty"`
+	FilePath         string   `json:"file_path,omitempty"`
+	ExistingFileName string   `json:"existing_file_name,omitempty"`
+	ExistingFilePath string   `json:"existing_file_path,omitempty"`
+	Genres           []string `json:"genres,omitempty"`
+	HasPoster        bool     `json:"has_poster,omitempty"`
+}
+
 type ComparisonGroup struct {
-	ID                    string         `json:"id"`
-	Filename              string         `json:"filename"`
-	RelPath               string         `json:"rel_path"`
-	Ext                   string         `json:"ext"`
-	Size                  int64          `json:"size"`
-	Status                string         `json:"status"`
-	SeedingSummary        string         `json:"seeding_summary"`
-	HasTrackerIssue       bool           `json:"has_tracker_issue"`
-	HasUnregistered       bool           `json:"has_unregistered"`
-	ArrSummary            string         `json:"arr_summary"`
-	HasArrIssue           bool           `json:"has_arr_issue"`
-	SoleCopyOnDisk        bool           `json:"sole_copy_on_disk"`
-	ExternalHardlinkCount int            `json:"external_hardlink_count"`
-	CanHardlink           bool           `json:"can_hardlink"`
-	HardlinkPairs         []HardlinkPair `json:"hardlink_pairs"`
-	WastedBytes           int64          `json:"wasted_bytes"`
-	ReclaimableBytes      int64          `json:"reclaimable_bytes"`
-	FolderAFiles          []ScannedFile  `json:"folder_a_files"`
-	FolderBFiles          []ScannedFile  `json:"folder_b_files"`
-	AllPaths              []string       `json:"all_paths"`
-	Torrents              []TorrentMatch `json:"torrents"`
-	ArrMatches            []ArrReference `json:"arr_matches"`
+	ID                    string          `json:"id"`
+	Filename              string          `json:"filename"`
+	RelPath               string          `json:"rel_path"`
+	Ext                   string          `json:"ext"`
+	Size                  int64           `json:"size"`
+	Status                string          `json:"status"`
+	SeedingSummary        string          `json:"seeding_summary"`
+	HasTrackerIssue       bool            `json:"has_tracker_issue"`
+	HasUnregistered       bool            `json:"has_unregistered"`
+	ArrSummary            string          `json:"arr_summary"`
+	HasArrIssue           bool            `json:"has_arr_issue"`
+	PlexSummary           string          `json:"plex_summary"`
+	SoleCopyOnDisk        bool            `json:"sole_copy_on_disk"`
+	ExternalHardlinkCount int             `json:"external_hardlink_count"`
+	CanHardlink           bool            `json:"can_hardlink"`
+	HardlinkPairs         []HardlinkPair  `json:"hardlink_pairs"`
+	WastedBytes           int64           `json:"wasted_bytes"`
+	ReclaimableBytes      int64           `json:"reclaimable_bytes"`
+	FolderAFiles          []ScannedFile   `json:"folder_a_files"`
+	FolderBFiles          []ScannedFile   `json:"folder_b_files"`
+	AllPaths              []string        `json:"all_paths"`
+	Torrents              []TorrentMatch  `json:"torrents"`
+	ArrMatches            []ArrReference  `json:"arr_matches"`
+	PlexMatches           []PlexReference `json:"plex_matches"`
 }
 
 type Summary struct {
@@ -148,6 +171,9 @@ type Summary struct {
 	ArrIssueCount                 int   `json:"arr_issue_count"`
 	ArrWantedNotImportedCount     int   `json:"arr_wanted_not_imported_count"`
 	ArrUnlinkedLibraryCount       int   `json:"arr_unlinked_library_count"`
+	PlexInLibraryCount            int   `json:"plex_in_library_count"`
+	PlexMissingCount              int   `json:"plex_missing_count"`
+	PlexOtherVersionCount         int   `json:"plex_other_version_count"`
 	TotalReclaimableBytes         int64 `json:"total_reclaimable_bytes"`
 }
 
@@ -159,6 +185,7 @@ type ScanResult struct {
 	Folders            []FolderStat          `json:"folders"`
 	QbitInstances      []qbit.InstanceReport `json:"qbit_instances"`
 	ArrInstances       []arr.InstanceReport  `json:"arr_instances"`
+	PlexInstances      []plex.InstanceReport `json:"plex_instances"`
 	Summary            Summary               `json:"summary"`
 	Groups             []ComparisonGroup     `json:"groups"`
 	ReadOnlyMode       bool                  `json:"read_only_mode"`
@@ -461,6 +488,15 @@ func hasEnabledArrInstance(settings config.AppSettings) bool {
 	return false
 }
 
+func hasEnabledPlexInstance(settings config.AppSettings) bool {
+	for _, p := range settings.PlexInstances {
+		if p.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
 // ScanFolders walks all configured folders concurrently and collects file metadata.
 func ScanFolders(settings config.AppSettings) ScannedFolders {
 	ignoreExts := buildIgnoreExtSet(settings)
@@ -565,7 +601,7 @@ func ScanFolders(settings config.AppSettings) ScannedFolders {
 	}
 }
 
-func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEnabledArr bool, qbitIndex *qbit.Index, arrIndex *arr.Index, groupID string) ComparisonGroup {
+func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEnabledArr bool, hasEnabledPlex bool, qbitIndex *qbit.Index, arrIndex *arr.Index, plexIndex *plex.Index, groupID string) ComparisonGroup {
 	sorted := make([]ScannedFile, len(groupFiles))
 	copy(sorted, groupFiles)
 	sort.Slice(sorted, func(i, j int) bool {
@@ -1089,6 +1125,121 @@ func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEn
 		}
 	}
 
+	// Correlate against Plex Media Server index
+	plexMatches := make([]PlexReference, 0)
+	plexSummary := "UNCONFIGURED"
+	if hasEnabledPlex {
+		type plexMatchKey struct {
+			InstanceID string
+			RatingKey  string
+			SubKey     string
+			Kind       string
+		}
+		seenPlex := make(map[plexMatchKey]struct{})
+		anyInPlex := false
+		anyOtherVersion := false
+
+		// 1. Exact path or name+size file matches
+		for _, f := range sorted {
+			for _, pm := range plexIndex.FindFileMatches(f.AbsPath, f.Filename, f.Size) {
+				k := plexMatchKey{
+					InstanceID: pm.Entry.InstanceID,
+					RatingKey:  pm.Entry.RatingKey,
+					SubKey:     pm.Entry.EpisodeKey,
+					Kind:       "in_plex",
+				}
+				if _, dup := seenPlex[k]; dup {
+					continue
+				}
+				seenPlex[k] = struct{}{}
+				anyInPlex = true
+				plexMatches = append(plexMatches, PlexReference{
+					InstanceID:    pm.Entry.InstanceID,
+					InstanceName:  pm.Entry.InstanceName,
+					LibraryTitle:  pm.Entry.LibraryTitle,
+					MediaType:     pm.Entry.MediaType,
+					RatingKey:     pm.Entry.RatingKey,
+					EpisodeKey:    pm.Entry.EpisodeKey,
+					Title:         pm.Entry.Title,
+					Year:          pm.Entry.Year,
+					SeasonNumber:  pm.Entry.SeasonNumber,
+					EpisodeNumber: pm.Entry.EpisodeNumber,
+					MatchKind:     "in_plex",
+					StatusMessage: "Indexed in Plex",
+					FilePath:      pm.Entry.MappedPath,
+					Genres:        pm.Entry.Genres,
+					HasPoster:     pm.Entry.HasPoster,
+				})
+			}
+		}
+
+		// 2. Title + year / SxxExx matches when this exact file is not indexed in Plex
+		if !anyInPlex {
+			nameCandidates := make([]string, 0, len(sorted))
+			for _, f := range sorted {
+				nameCandidates = append(nameCandidates, f.Filename)
+			}
+			torrentNames := make([]string, 0, len(torrents))
+			for _, t := range torrents {
+				torrentNames = append(torrentNames, t.TorrentName)
+			}
+			if len(torrentNames) == 0 {
+				torrentNames = []string{""}
+			}
+			for _, fn := range nameCandidates {
+				for _, tn := range torrentNames {
+					for _, tm := range plexIndex.FindTitleMatches(fn, tn) {
+						kind := "series_missing_episode"
+						if tm.HasMatchingFile {
+							kind = "other_version"
+							anyOtherVersion = true
+						}
+						subKey := ""
+						if tm.MediaType == "show" && (tm.SeasonNumber > 0 || tm.EpisodeNumber > 0) {
+							subKey = fmt.Sprintf("S%dE%d", tm.SeasonNumber, tm.EpisodeNumber)
+						}
+						k := plexMatchKey{
+							InstanceID: tm.InstanceID,
+							RatingKey:  tm.RatingKey,
+							SubKey:     subKey,
+							Kind:       kind,
+						}
+						if _, dup := seenPlex[k]; dup {
+							continue
+						}
+						seenPlex[k] = struct{}{}
+						plexMatches = append(plexMatches, PlexReference{
+							InstanceID:       tm.InstanceID,
+							InstanceName:     tm.InstanceName,
+							LibraryTitle:     tm.LibraryTitle,
+							MediaType:        tm.MediaType,
+							RatingKey:        tm.RatingKey,
+							Title:            tm.Title,
+							Year:             tm.Year,
+							SeasonNumber:     tm.SeasonNumber,
+							EpisodeNumber:    tm.EpisodeNumber,
+							MatchKind:        kind,
+							StatusMessage:    tm.StatusMessage,
+							ExistingFileName: tm.ExistingFileName,
+							ExistingFilePath: tm.ExistingFilePath,
+							Genres:           tm.Genres,
+							HasPoster:        tm.HasPoster,
+						})
+					}
+				}
+			}
+		}
+
+		switch {
+		case anyInPlex:
+			plexSummary = "IN_PLEX"
+		case anyOtherVersion:
+			plexSummary = "OTHER_VERSION_IN_PLEX"
+		default:
+			plexSummary = "NOT_IN_PLEX"
+		}
+	}
+
 	return ComparisonGroup{
 		ID:                    groupID,
 		Filename:              repFile.Filename,
@@ -1101,6 +1252,7 @@ func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEn
 		HasUnregistered:       anyUnregistered,
 		ArrSummary:            arrSummary,
 		HasArrIssue:           hasArrIssue,
+		PlexSummary:           plexSummary,
 		SoleCopyOnDisk:        soleCopyOnDisk,
 		ExternalHardlinkCount: externalHardlinkCount,
 		CanHardlink:           canHardlink,
@@ -1112,6 +1264,7 @@ func evaluateCluster(groupFiles []ScannedFile, primaryIDs map[string]bool, hasEn
 		AllPaths:              allPaths,
 		Torrents:              torrents,
 		ArrMatches:            arrMatches,
+		PlexMatches:           plexMatches,
 	}
 }
 
@@ -1197,6 +1350,15 @@ func RecalculateSummary(groups []ComparisonGroup) Summary {
 			summary.ArrIssueCount++
 			summary.ArrUnlinkedLibraryCount++
 		}
+
+		switch g.PlexSummary {
+		case "IN_PLEX":
+			summary.PlexInLibraryCount++
+		case "NOT_IN_PLEX":
+			summary.PlexMissingCount++
+		case "OTHER_VERSION_IN_PLEX":
+			summary.PlexOtherVersionCount++
+		}
 	}
 
 	physicalBytes := zeroInodeBytes
@@ -1217,13 +1379,16 @@ func RecalculateSummary(groups []ComparisonGroup) Summary {
 	return summary
 }
 
-// CompareScanned correlates pre-walked folder files against qBittorrent and Radarr/Sonarr indices.
-func CompareScanned(settings config.AppSettings, scanned ScannedFolders, qbitIndex *qbit.Index, arrIndex *arr.Index, startedAt time.Time) ScanResult {
+// CompareScanned correlates pre-walked folder files against qBittorrent, Radarr/Sonarr, and Plex indices.
+func CompareScanned(settings config.AppSettings, scanned ScannedFolders, qbitIndex *qbit.Index, arrIndex *arr.Index, plexIndex *plex.Index, startedAt time.Time) ScanResult {
 	if qbitIndex == nil {
 		qbitIndex = qbit.NewIndex()
 	}
 	if arrIndex == nil {
 		arrIndex = arr.NewIndex()
+	}
+	if plexIndex == nil {
+		plexIndex = plex.NewIndex()
 	}
 
 	warnings := make([]string, len(scanned.Warnings))
@@ -1239,8 +1404,14 @@ func CompareScanned(settings config.AppSettings, scanned ScannedFolders, qbitInd
 			warnings = append(warnings, fmt.Sprintf("%s '%s' error: %s", strings.ToUpper(rep.AppType[:1])+rep.AppType[1:], rep.InstanceName, *rep.Error))
 		}
 	}
+	for _, rep := range plexIndex.Instances {
+		if !rep.OK && rep.Error != nil && *rep.Error != "Disabled" {
+			warnings = append(warnings, fmt.Sprintf("Plex '%s' error: %s", rep.InstanceName, *rep.Error))
+		}
+	}
 
 	hasEnabledArr := hasEnabledArrInstance(settings)
+	hasEnabledPlex := hasEnabledPlexInstance(settings)
 	primaryIDs := scanned.PrimaryIDs
 	if len(primaryIDs) == 0 {
 		primaryIDs = primaryFolderIDs(settings)
@@ -1249,7 +1420,7 @@ func CompareScanned(settings config.AppSettings, scanned ScannedFolders, qbitInd
 	clusters := clusterFiles(scanned.Files)
 	groups := make([]ComparisonGroup, 0, len(clusters))
 	for idx, groupFiles := range clusters {
-		groups = append(groups, evaluateCluster(groupFiles, primaryIDs, hasEnabledArr, qbitIndex, arrIndex, fmt.Sprintf("grp-%d", idx+1)))
+		groups = append(groups, evaluateCluster(groupFiles, primaryIDs, hasEnabledArr, hasEnabledPlex, qbitIndex, arrIndex, plexIndex, fmt.Sprintf("grp-%d", idx+1)))
 	}
 
 	priority := map[string]int{
@@ -1286,6 +1457,9 @@ func CompareScanned(settings config.AppSettings, scanned ScannedFolders, qbitInd
 	arrInstancesOut := make([]arr.InstanceReport, len(arrIndex.Instances))
 	copy(arrInstancesOut, arrIndex.Instances)
 
+	plexInstancesOut := make([]plex.InstanceReport, len(plexIndex.Instances))
+	copy(plexInstancesOut, plexIndex.Instances)
+
 	return ScanResult{
 		ScannedAt:          float64(time.Now().UnixNano()) / 1e9,
 		DurationMS:         durationMS,
@@ -1294,16 +1468,17 @@ func CompareScanned(settings config.AppSettings, scanned ScannedFolders, qbitInd
 		Folders:            scanned.FolderStats,
 		QbitInstances:      instancesOut,
 		ArrInstances:       arrInstancesOut,
+		PlexInstances:      plexInstancesOut,
 		Summary:            summary,
 		Groups:             groups,
 		ReadOnlyMode:       settings.ReadOnlyMode,
 	}
 }
 
-func ScanAndCompare(settings config.AppSettings, qbitIndex *qbit.Index, arrIndex *arr.Index) ScanResult {
+func ScanAndCompare(settings config.AppSettings, qbitIndex *qbit.Index, arrIndex *arr.Index, plexIndex *plex.Index) ScanResult {
 	start := time.Now()
 	scanned := ScanFolders(settings)
-	return CompareScanned(settings, scanned, qbitIndex, arrIndex, start)
+	return CompareScanned(settings, scanned, qbitIndex, arrIndex, plexIndex, start)
 }
 
 func pathCompareKey(p string) string {
@@ -1398,18 +1573,22 @@ func statScannedFileFromDisk(folder config.FolderConfig, absPath string, ignoreE
 }
 
 // RefreshSingleGroup re-stats a single cluster's paths on disk (plus any newly discovered Arr paths)
-// and re-evaluates its status against targeted qBittorrent and Arr indices.
+// and re-evaluates its status against targeted qBittorrent, Arr, and cached Plex indices.
 // Returns (ComparisonGroup{}, false) if no files remain on disk for this group.
-func RefreshSingleGroup(settings config.AppSettings, prev ComparisonGroup, qbitIndex *qbit.Index, arrIndex *arr.Index, discoveredArrPaths []string) (ComparisonGroup, bool) {
+func RefreshSingleGroup(settings config.AppSettings, prev ComparisonGroup, qbitIndex *qbit.Index, arrIndex *arr.Index, plexIndex *plex.Index, discoveredArrPaths []string) (ComparisonGroup, bool) {
 	if qbitIndex == nil {
 		qbitIndex = qbit.NewIndex()
 	}
 	if arrIndex == nil {
 		arrIndex = arr.NewIndex()
 	}
+	if plexIndex == nil {
+		plexIndex = plex.NewIndex()
+	}
 
 	primaryIDs := primaryFolderIDs(settings)
 	hasEnabledArr := hasEnabledArrInstance(settings)
+	hasEnabledPlex := hasEnabledPlexInstance(settings)
 	ignoreExts := buildIgnoreExtSet(settings)
 
 	folderByID := make(map[string]config.FolderConfig, len(settings.Folders))
@@ -1525,7 +1704,7 @@ func RefreshSingleGroup(settings config.AppSettings, prev ComparisonGroup, qbitI
 		return ComparisonGroup{}, false
 	}
 
-	return evaluateCluster(groupFiles, primaryIDs, hasEnabledArr, qbitIndex, arrIndex, prev.ID), true
+	return evaluateCluster(groupFiles, primaryIDs, hasEnabledArr, hasEnabledPlex, qbitIndex, arrIndex, plexIndex, prev.ID), true
 }
 
 func containsStr(list []string, target string) bool {

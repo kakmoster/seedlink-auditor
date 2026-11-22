@@ -8,6 +8,7 @@
       folders: [],
       qbit_instances: [],
       arr_instances: [],
+      plex_instances: [],
       ignore_extensions: [],
       min_size_bytes: 0,
     },
@@ -17,6 +18,7 @@
     search: "",
     seedingFilter: "ALL",
     arrFilter: "ALL",
+    plexFilter: "ALL",
     folderFilter: "ALL",
     genreFilter: "ALL",
     sortBy: "default",
@@ -184,6 +186,61 @@
         .join("");
     }
 
+    const plexChips = $("plexChips");
+    const plexInstances = state.config.plex_instances || [];
+    const scanPlexInstances = (state.scan && state.scan.plex_instances) || [];
+    if (plexChips) {
+      if (plexInstances.length === 0) {
+        plexChips.innerHTML = `<span class="chip chip-muted">No servers configured</span>`;
+      } else {
+        plexChips.innerHTML = plexInstances
+          .map((inst) => {
+            const rep = scanPlexInstances.find((r) => r.instance_id === inst.id);
+            let cls = "";
+            let suffix = inst.enabled ? "" : " (disabled)";
+            if (rep) {
+              if (rep.ok && inst.enabled) {
+                cls = "chip-ok";
+                suffix = ` (${rep.item_count} items)`;
+              } else if (!rep.ok) {
+                cls = "chip-err";
+                suffix = " (error)";
+              }
+            }
+            return `<span class="chip ${cls}" title="${escapeHtml(inst.url)}">${escapeHtml(inst.name)}${escapeHtml(suffix)}</span>`;
+          })
+          .join("");
+      }
+    }
+
+    const hasPlex =
+      plexInstances.some((p) => p.enabled) ||
+      Boolean(
+        state.scan &&
+          Array.isArray(state.scan.groups) &&
+          state.scan.groups.some((g) => g.plex_summary && g.plex_summary !== "UNCONFIGURED")
+      );
+    const plexFilterEl = $("plexFilter");
+    if (plexFilterEl) {
+      plexFilterEl.hidden = !hasPlex;
+      if (!hasPlex) {
+        state.plexFilter = "ALL";
+        plexFilterEl.value = "ALL";
+      }
+    }
+    const tabMissingPlexEl = $("tabMissingPlex");
+    if (tabMissingPlexEl) {
+      tabMissingPlexEl.hidden = !hasPlex;
+      if (!hasPlex && state.activeTab === "MISSING_IN_PLEX") {
+        state.activeTab = "ALL";
+        syncActiveTabUi();
+      }
+    }
+    const colArrHeader = $("colArrHeader");
+    if (colArrHeader) {
+      colArrHeader.textContent = hasPlex ? "Radarr / Sonarr & Plex" : "Radarr / Sonarr";
+    }
+
     if (state.scan) {
       const s = state.scan.summary;
       $("scanMeta").textContent =
@@ -206,7 +263,7 @@
 
     const byLower = new Map();
     for (const grp of state.scan.groups) {
-      for (const m of grp.arr_matches || []) {
+      for (const m of [...(grp.arr_matches || []), ...(grp.plex_matches || [])]) {
         for (const raw of m.genres || []) {
           const g = String(raw || "").trim();
           if (!g) continue;
@@ -285,6 +342,9 @@
     $("tabCountUntracked").textContent = String(s.untracked_count);
     $("tabCountTrackerIssue").textContent = String(s.tracker_error_count || 0);
     $("tabCountArrIssue").textContent = String(s.arr_issue_count || 0);
+    if ($("tabCountMissingPlex")) {
+      $("tabCountMissingPlex").textContent = String(s.plex_missing_count || 0);
+    }
     $("tabCountOnlyA").textContent = String(s.only_in_a_count);
   }
 
@@ -459,6 +519,7 @@
       let reclaimable = 0;
       const statusCounts = {};
       const arrCounts = {};
+      const plexCounts = {};
       let anySeeding = false;
       let anyUnregistered = false;
       let anyError = false;
@@ -473,6 +534,7 @@
       const foldersA = new Map();
       const foldersB = new Map();
       let repArrMatch = null;
+      let repPlexMatch = null;
 
       for (const m of members) {
         size += m.size || 0;
@@ -480,6 +542,8 @@
         statusCounts[m.status] = (statusCounts[m.status] || 0) + 1;
         const as = m.arr_summary || "NOT_IN_ARR";
         arrCounts[as] = (arrCounts[as] || 0) + 1;
+        const ps = m.plex_summary || "UNCONFIGURED";
+        plexCounts[ps] = (plexCounts[ps] || 0) + 1;
         if (m.has_arr_issue) hasArrIssue = true;
         if ((m.arr_matches || []).some((a) => a.can_import)) hasCanImport = true;
         if ((m.arr_matches || []).some((a) => a.can_rescan)) hasCanRescan = true;
@@ -498,6 +562,9 @@
         }
         if (!repArrMatch && (m.arr_matches || []).length > 0) {
           repArrMatch = m.arr_matches[0];
+        }
+        if (!repPlexMatch && (m.plex_matches || []).length > 0) {
+          repPlexMatch = m.plex_matches[0];
         }
       }
 
@@ -534,6 +601,17 @@
         }
       }
 
+      const plexInCount = plexCounts.IN_PLEX || 0;
+      const plexOtherCount = plexCounts.OTHER_VERSION_IN_PLEX || 0;
+      const plexUnconfCount = plexCounts.UNCONFIGURED || 0;
+      let primaryPlexSummary = "UNCONFIGURED";
+      if (plexUnconfCount < members.length) {
+        if (plexInCount === members.length) primaryPlexSummary = "IN_PLEX";
+        else if (plexInCount > 0) primaryPlexSummary = "PARTIAL_IN_PLEX";
+        else if (plexOtherCount > 0) primaryPlexSummary = "OTHER_VERSION_IN_PLEX";
+        else primaryPlexSummary = "NOT_IN_PLEX";
+      }
+
       displayRows.push({
         kind: "pack",
         id: packId,
@@ -560,6 +638,10 @@
         hasMixedArr: Object.keys(arrCounts).length > 1,
         hasArrIssue,
         repArrMatch,
+        plex_summary: primaryPlexSummary,
+        plexCounts,
+        plexInCount,
+        repPlexMatch,
         hasCanImport,
         hasCanRescan,
         hasErroredTorrents: uniqueTorrents.some((t) => Boolean(t.tracker_health)),
@@ -582,6 +664,8 @@
     return state.scan.groups.filter((grp) => {
       if (state.activeTab === "ARR_ISSUE") {
         if (!grp.has_arr_issue) return false;
+      } else if (state.activeTab === "MISSING_IN_PLEX") {
+        if (grp.plex_summary !== "NOT_IN_PLEX") return false;
       } else if (state.activeTab === "TRACKER_ISSUE") {
         if (!grp.has_tracker_issue) return false;
       } else if (state.activeTab === "UNTRACKED") {
@@ -602,6 +686,10 @@
         return false;
       }
 
+      if (state.plexFilter !== "ALL" && grp.plex_summary !== state.plexFilter) {
+        return false;
+      }
+
       if (state.folderFilter !== "ALL") {
         const files = [...grp.folder_a_files, ...grp.folder_b_files];
         if (!files.some((f) => f.folder_id === state.folderFilter)) return false;
@@ -609,7 +697,7 @@
 
       if (state.genreFilter !== "ALL" && isMediaMetadataEnabled()) {
         const targetGenre = state.genreFilter.toLowerCase();
-        const hasGenre = (grp.arr_matches || []).some((m) =>
+        const hasGenre = [...(grp.arr_matches || []), ...(grp.plex_matches || [])].some((m) =>
           (m.genres || []).some((gn) => String(gn || "").toLowerCase() === targetGenre)
         );
         if (!hasGenre) return false;
@@ -620,6 +708,7 @@
           grp.filename,
           grp.rel_path,
           grp.arr_summary || "",
+          grp.plex_summary || "",
           ...grp.all_paths,
           ...grp.torrents.map(
             (t) => `${t.torrent_name} ${t.tracker_host} ${t.instance_name} ${t.tracker_health || ""} ${t.tracker_msg || ""}`
@@ -627,6 +716,10 @@
           ...(grp.arr_matches || []).map(
             (m) =>
               `${m.instance_name} ${m.app_type} ${m.title} ${m.status_message || ""} ${m.existing_file_name || ""} ${(m.genres || []).join(" ")}`
+          ),
+          ...(grp.plex_matches || []).map(
+            (m) =>
+              `${m.instance_name} ${m.library_title || ""} ${m.media_type || ""} ${m.title} ${m.status_message || ""} ${m.existing_file_name || ""} ${(m.genres || []).join(" ")}`
           ),
         ]
           .join(" ")
@@ -734,12 +827,31 @@
     }
   }
 
+  function renderPlexBadge(plexSummary, pack = null) {
+    switch (plexSummary) {
+      case "IN_PLEX":
+        return `<span class="status-pill pill-plex-in">IN PLEX</span>`;
+      case "PARTIAL_IN_PLEX":
+        return `<span class="status-pill pill-plex-partial">${pack ? `${pack.plexInCount}/${pack.members.length} IN PLEX` : "PARTIAL PLEX"}</span>`;
+      case "OTHER_VERSION_IN_PLEX":
+        return `<span class="status-pill pill-plex-other">PLEX HAS OTHER</span>`;
+      case "NOT_IN_PLEX":
+        return `<span class="status-pill pill-plex-missing">MISSING IN PLEX</span>`;
+      default:
+        return "";
+    }
+  }
+
   function isMediaMetadataEnabled() {
     return state.config.show_media_metadata !== false;
   }
 
   function posterUrlFor(instanceId, itemId) {
     return `/api/arr/poster?instance_id=${encodeURIComponent(instanceId)}&item_id=${encodeURIComponent(itemId)}`;
+  }
+
+  function plexPosterUrlFor(instanceId, ratingKey) {
+    return `/api/plex/poster?instance_id=${encodeURIComponent(instanceId)}&rating_key=${encodeURIComponent(ratingKey)}`;
   }
 
   function pickPreferredArrMatch(arrMatches) {
@@ -757,27 +869,64 @@
     return candidates[0];
   }
 
+  function pickPreferredPlexMatch(plexMatches) {
+    const order = { in_plex: 0, other_version: 1, series_missing_episode: 2 };
+    const candidates = (plexMatches || []).filter(
+      (m) => m && m.rating_key && (m.has_poster || (m.genres && m.genres.length > 0))
+    );
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => {
+      const pa = Object.prototype.hasOwnProperty.call(order, a.match_kind) ? order[a.match_kind] : 9;
+      const pb = Object.prototype.hasOwnProperty.call(order, b.match_kind) ? order[b.match_kind] : 9;
+      if (pa !== pb) return pa - pb;
+      return (b.has_poster ? 1 : 0) - (a.has_poster ? 1 : 0);
+    });
+    return candidates[0];
+  }
+
+  function renderPlexTitle(m) {
+    if (m.media_type === "show" && (m.season_number > 0 || m.episode_number > 0)) {
+      const epStr = `S${String(m.season_number || 0).padStart(2, "0")}E${String(m.episode_number || 0).padStart(2, "0")}`;
+      return `${m.title} ${epStr}`;
+    }
+    return m.year > 0 ? `${m.title} (${m.year})` : m.title;
+  }
+
   function getGroupMediaMeta(grp) {
-    const m = pickPreferredArrMatch(grp && grp.arr_matches);
-    if (!m) return null;
+    const arrM = pickPreferredArrMatch(grp && grp.arr_matches);
+    const plexM = pickPreferredPlexMatch(grp && grp.plex_matches);
+    const arrPoster = arrM && arrM.has_poster && arrM.item_id > 0 ? posterUrlFor(arrM.instance_id, arrM.item_id) : "";
+    const plexPoster = plexM && plexM.has_poster && plexM.rating_key ? plexPosterUrlFor(plexM.instance_id, plexM.rating_key) : "";
+    const arrGenres = (arrM && arrM.genres) || [];
+    const plexGenres = (plexM && plexM.genres) || [];
+    const posterUrl = arrPoster || plexPoster;
+    const genres = arrGenres.length > 0 ? arrGenres : plexGenres;
+    if (!posterUrl && genres.length === 0) return null;
+    const title = arrM ? renderArrTitle(arrM) : plexM ? renderPlexTitle(plexM) : "";
     return {
-      instanceId: m.instance_id,
-      itemId: m.item_id,
-      title: renderArrTitle(m),
-      genres: m.genres || [],
-      hasPoster: Boolean(m.has_poster),
+      posterUrl,
+      title,
+      genres,
+      hasPoster: Boolean(posterUrl),
     };
   }
 
   function getPackMediaMeta(pack) {
-    const rep = pack && pack.repArrMatch;
-    if (rep && rep.item_id > 0 && (rep.has_poster || (rep.genres && rep.genres.length > 0))) {
+    const arrM = pack && pack.repArrMatch;
+    const plexM = pack && pack.repPlexMatch;
+    const arrPoster = arrM && arrM.has_poster && arrM.item_id > 0 ? posterUrlFor(arrM.instance_id, arrM.item_id) : "";
+    const plexPoster = plexM && plexM.has_poster && plexM.rating_key ? plexPosterUrlFor(plexM.instance_id, plexM.rating_key) : "";
+    const arrGenres = (arrM && arrM.genres) || [];
+    const plexGenres = (plexM && plexM.genres) || [];
+    const posterUrl = arrPoster || plexPoster;
+    const genres = arrGenres.length > 0 ? arrGenres : plexGenres;
+    if (posterUrl || genres.length > 0) {
+      const ref = arrM || plexM;
       return {
-        instanceId: rep.instance_id,
-        itemId: rep.item_id,
-        title: rep.year > 0 ? `${rep.title} (${rep.year})` : rep.title || pack.title,
-        genres: rep.genres || [],
-        hasPoster: Boolean(rep.has_poster),
+        posterUrl,
+        title: ref.year > 0 ? `${ref.title} (${ref.year})` : ref.title || pack.title,
+        genres,
+        hasPoster: Boolean(posterUrl),
       };
     }
     for (const m of (pack && pack.members) || []) {
@@ -788,8 +937,8 @@
   }
 
   function renderPosterThumbHtml(meta) {
-    if (!isMediaMetadataEnabled() || !meta || !meta.hasPoster || !meta.itemId) return "";
-    const url = posterUrlFor(meta.instanceId, meta.itemId);
+    if (!isMediaMetadataEnabled() || !meta || !meta.hasPoster || !meta.posterUrl) return "";
+    const url = meta.posterUrl;
     return `<div class="poster-thumb-wrap" data-poster-url="${escapeHtml(url)}" data-poster-title="${escapeHtml(meta.title || "")}" data-poster-genres="${escapeHtml((meta.genres || []).join(", "))}">
       <img class="poster-thumb" src="${escapeHtml(url)}" alt="" loading="lazy" decoding="async" onerror="this.parentElement.hidden=true" />
     </div>`;
@@ -899,11 +1048,53 @@
               })
               .join("");
 
+    const hasPlexCol = Boolean(grp.plex_summary && grp.plex_summary !== "UNCONFIGURED");
+    const plexMatches = grp.plex_matches || [];
+    const plexHtml = !hasPlexCol
+      ? ""
+      : plexMatches.length === 0
+        ? `<div class="torrent-sub">Not found in any configured Plex library</div>`
+        : plexMatches
+            .map((m) => {
+              const showMeta = isMediaMetadataEnabled();
+              const posterHtml =
+                showMeta && m.has_poster && m.rating_key
+                  ? `<img class="arr-detail-poster" src="${escapeHtml(plexPosterUrlFor(m.instance_id, m.rating_key))}" alt="" loading="lazy" decoding="async" onerror="this.hidden=true" />`
+                  : "";
+              const genresHtml =
+                showMeta && m.genres && m.genres.length > 0
+                  ? `<div class="arr-genres-row">${renderGenrePillsHtml(m.genres, 0)}</div>`
+                  : "";
+              const isWarn = m.match_kind === "series_missing_episode";
+              const bodyHtml = `
+                <div class="torrent-top">
+                  <span class="plex-type-badge">${escapeHtml(m.media_type === "show" ? "Series" : "Movie")}</span>
+                  <span class="instance-badge">${escapeHtml(m.instance_name)}</span>
+                  ${m.library_title ? `<span class="nlink-badge">${escapeHtml(m.library_title)}</span>` : ""}
+                </div>
+                <div class="torrent-name">${escapeHtml(renderPlexTitle(m))}</div>
+                ${genresHtml}
+                ${
+                  m.existing_file_name
+                    ? `<div class="torrent-sub">Plex already has another version:</div><div class="arr-existing-file" title="${escapeHtml(m.existing_file_path || m.existing_file_name)}">${escapeHtml(m.existing_file_name)}</div>`
+                    : m.status_message
+                      ? `<div class="${isWarn ? "arr-msg" : "torrent-sub"}">${escapeHtml(m.status_message)}</div>`
+                      : ""
+                }
+                ${m.file_path ? `<div class="torrent-sub" title="${escapeHtml(m.file_path)}">File: ${escapeHtml(m.file_path)}</div>` : ""}
+              `;
+              return `
+            <div class="arr-item ${isWarn ? "has-issue" : ""}">
+              ${posterHtml ? `<div class="arr-item-with-poster">${posterHtml}<div class="arr-item-body">${bodyHtml}</div></div>` : bodyHtml}
+            </div>`;
+            })
+            .join("");
+
     return `
       <tr class="detail-row ${isPackChild ? "pack-child-detail-row" : ""}" data-detail-for="${escapeHtml(grp.id)}">
         <td colspan="7">
           <div class="detail-panel">
-            <div class="detail-grid">
+            <div class="detail-grid ${hasPlexCol ? "detail-grid-4" : ""}">
               <div>
                 <div class="detail-col-title">Disk Locations &amp; Inodes</div>
                 ${folderHtml}
@@ -916,6 +1107,14 @@
                 <div class="detail-col-title">Radarr / Sonarr (${arrMatches.length})</div>
                 ${arrHtml}
               </div>
+              ${
+                hasPlexCol
+                  ? `<div>
+                <div class="detail-col-title">Plex (${plexMatches.length})</div>
+                ${plexHtml}
+              </div>`
+                  : ""
+              }
             </div>
           </div>
         </td>
@@ -964,13 +1163,31 @@
     return `<div class="cell-sub-trunc">${list.length} torrents${escapeHtml(extra)}</div>`;
   }
 
+  function formatCompactPlexSummary(grp) {
+    const list = grp.plex_matches || [];
+    if (list.length === 0) {
+      return `<div class="cell-sub-trunc">Not in Plex</div>`;
+    }
+    const primary = list[0];
+    if (primary.existing_file_name) {
+      return `<div class="cell-sub-trunc" title="Plex already has: ${escapeHtml(primary.existing_file_path || primary.existing_file_name)}">Plex has: ${escapeHtml(primary.existing_file_name)}</div>`;
+    }
+    if (primary.match_kind === "series_missing_episode") {
+      return `<div class="cell-sub-trunc" title="${escapeHtml(primary.status_message || "")}">${escapeHtml(primary.status_message || "Series in Plex (episode missing)")}</div>`;
+    }
+    const sec = primary.library_title ? ` (${primary.library_title})` : "";
+    const label = `${primary.instance_name}${sec}: ${renderPlexTitle(primary)}`;
+    return `<div class="cell-sub-trunc" title="${escapeHtml(primary.file_path || label)}">${escapeHtml(label)}</div>`;
+  }
+
   function formatCompactArrSummary(grp) {
     const list = grp.arr_matches || [];
+    const hasPlex = grp.plex_summary && grp.plex_summary !== "UNCONFIGURED";
     if (grp.arr_summary === "UNCONFIGURED") {
-      return `<div class="cell-sub-trunc">Not configured</div>`;
+      return hasPlex ? formatCompactPlexSummary(grp) : `<div class="cell-sub-trunc">Not configured</div>`;
     }
     if (list.length === 0) {
-      return `<div class="cell-sub-trunc">No match</div>`;
+      return hasPlex ? formatCompactPlexSummary(grp) : `<div class="cell-sub-trunc">No match</div>`;
     }
     const primary = list[0];
     if (primary.existing_file_name) {
@@ -1122,7 +1339,10 @@
         </td>
         <td class="col-arr">
           <div class="cell-stack">
-            ${renderArrBadge(grp.arr_summary)}
+            <div class="cell-badges">
+              ${grp.arr_summary !== "UNCONFIGURED" || !grp.plex_summary || grp.plex_summary === "UNCONFIGURED" ? renderArrBadge(grp.arr_summary) : ""}
+              ${grp.plex_summary && grp.plex_summary !== "UNCONFIGURED" ? renderPlexBadge(grp.plex_summary) : ""}
+            </div>
             ${formatCompactArrSummary(grp)}
             ${arrSyncHtml}
           </div>
@@ -1156,9 +1376,30 @@
     return `<div class="cell-badges">${chips.join("")}${nlinkTag}</div>`;
   }
 
+  function formatCompactPackPlex(pack) {
+    if (!pack.plex_summary || pack.plex_summary === "UNCONFIGURED") {
+      return `<div class="cell-sub-trunc">Not in Plex</div>`;
+    }
+    if (!pack.repPlexMatch) {
+      return `<div class="cell-sub-trunc">Not in Plex</div>`;
+    }
+    const m = pack.repPlexMatch;
+    if (pack.plex_summary === "PARTIAL_IN_PLEX") {
+      return `<div class="cell-sub-trunc" title="${pack.plexInCount} of ${pack.members.length} files in Plex">${escapeHtml(m.instance_name)}: ${escapeHtml(m.title)} (${pack.plexInCount}/${pack.members.length} in Plex)</div>`;
+    }
+    if (m.existing_file_name) {
+      return `<div class="cell-sub-trunc" title="${escapeHtml(m.existing_file_path || m.existing_file_name)}">Plex has another version</div>`;
+    }
+    if (m.match_kind === "series_missing_episode") {
+      return `<div class="cell-sub-trunc">${escapeHtml(m.title)}: episodes missing in Plex</div>`;
+    }
+    return `<div class="cell-sub-trunc">${escapeHtml(m.instance_name)}: ${escapeHtml(m.title)} (${pack.members.length} files)</div>`;
+  }
+
   function formatCompactPackArr(pack) {
+    const hasPlex = pack.plex_summary && pack.plex_summary !== "UNCONFIGURED";
     if (pack.arr_summary === "UNCONFIGURED") {
-      return `<div class="cell-sub-trunc">Not configured</div>`;
+      return hasPlex ? formatCompactPackPlex(pack) : `<div class="cell-sub-trunc">Not configured</div>`;
     }
     if (pack.hasMixedArr) {
       const labels = {
@@ -1173,7 +1414,7 @@
       return `<div class="cell-sub-trunc" title="${escapeHtml(parts.join(", "))}">${escapeHtml(parts.join(", "))}</div>`;
     }
     if (!pack.repArrMatch) {
-      return `<div class="cell-sub-trunc">No match</div>`;
+      return hasPlex ? formatCompactPackPlex(pack) : `<div class="cell-sub-trunc">No match</div>`;
     }
     const m = pack.repArrMatch;
     if (m.existing_file_name) {
@@ -1280,7 +1521,10 @@
         </td>
         <td class="col-arr">
           <div class="cell-stack">
-            ${renderArrBadge(pack.arr_summary)}
+            <div class="cell-badges">
+              ${pack.arr_summary !== "UNCONFIGURED" || !pack.plex_summary || pack.plex_summary === "UNCONFIGURED" ? renderArrBadge(pack.arr_summary) : ""}
+              ${pack.plex_summary && pack.plex_summary !== "UNCONFIGURED" ? renderPlexBadge(pack.plex_summary, pack) : ""}
+            </div>
             ${formatCompactPackArr(pack)}
             ${arrSyncHtml}
           </div>
@@ -2859,6 +3103,7 @@
     state.draftConfig.folders = state.draftConfig.folders || [];
     state.draftConfig.qbit_instances = state.draftConfig.qbit_instances || [];
     state.draftConfig.arr_instances = state.draftConfig.arr_instances || [];
+    state.draftConfig.plex_instances = state.draftConfig.plex_instances || [];
     if (state.draftConfig.folders.length === 0) {
       state.draftConfig.folders.push(
         { id: randomId("fld"), label: "Folder A (Original / Primary)", path: "/data/torrents", role: "primary" },
@@ -2884,6 +3129,9 @@
     }
     if ($("settingsCountArr")) {
       $("settingsCountArr").textContent = String((state.draftConfig.arr_instances || []).length);
+    }
+    if ($("settingsCountPlex")) {
+      $("settingsCountPlex").textContent = String((state.draftConfig.plex_instances || []).length);
     }
     const foldersList = $("foldersEditorList");
     foldersList.innerHTML = state.draftConfig.folders
@@ -3038,6 +3286,65 @@
         )
         .join("");
     }
+
+    const plexList = $("plexEditorList");
+    if (plexList) {
+      const plexInstances = state.draftConfig.plex_instances || [];
+      if (plexInstances.length === 0) {
+        plexList.innerHTML = `<div class="section-hint">No Plex servers configured yet. Click "+ Add Plex Server" above.</div>`;
+      } else {
+        plexList.innerHTML = plexInstances
+          .map(
+            (inst, idx) => `
+          <div class="editor-card" data-plex-idx="${idx}">
+            <div class="editor-grid">
+              <label class="field-group">
+                <span>Server Name</span>
+                <input class="input-control plex-name-in" data-idx="${idx}" value="${escapeHtml(inst.name)}" placeholder="Plex" />
+              </label>
+              <label class="field-group">
+                <span>URL</span>
+                <input class="input-control plex-url-in" data-idx="${idx}" value="${escapeHtml(inst.url)}" placeholder="http://192.168.1.100:32400" />
+              </label>
+              <label class="field-group">
+                <span>Plex Token (X-Plex-Token)</span>
+                <input class="input-control plex-token-in" data-idx="${idx}" type="password" value="${escapeHtml(inst.token)}" placeholder="X-Plex-Token" />
+              </label>
+            </div>
+
+            <div class="mapping-block">
+              <div class="editor-card-footer">
+                <span class="section-hint">Path Mappings (Plex path &rarr; SeedLink container path)</span>
+                <button class="btn btn-ghost btn-xs add-plex-mapping-btn" data-idx="${idx}" type="button">+ Add Mapping</button>
+              </div>
+              ${(inst.path_mappings || [])
+                .map(
+                  (m, mIdx) => `
+                <div class="mapping-row">
+                  <input class="input-control plex-map-remote-in" data-idx="${idx}" data-midx="${mIdx}" value="${escapeHtml(m.remote_prefix)}" placeholder="Plex prefix (e.g. /data/media)" />
+                  <input class="input-control plex-map-local-in" data-idx="${idx}" data-midx="${mIdx}" value="${escapeHtml(m.local_prefix)}" placeholder="Local prefix (e.g. /data/download)" />
+                  <button class="btn btn-outline-danger btn-xs remove-plex-map-btn" data-idx="${idx}" data-midx="${mIdx}" type="button">&times;</button>
+                </div>`
+                )
+                .join("")}
+            </div>
+
+            <div class="editor-card-footer">
+              <label style="display:flex;align-items:center;gap:6px;font-size:0.8rem;">
+                <input type="checkbox" class="plex-enabled-in" data-idx="${idx}" ${inst.enabled ? "checked" : ""} />
+                Enabled
+              </label>
+              <div style="display:flex;align-items:center;gap:8px;">
+                <span class="test-status" id="plexTestStatus-${idx}"></span>
+                <button class="btn btn-secondary btn-xs test-plex-btn" data-idx="${idx}" type="button">Test Connection</button>
+                <button class="btn btn-outline-danger btn-xs remove-plex-btn" data-idx="${idx}" type="button">Remove</button>
+              </div>
+            </div>
+          </div>`
+          )
+          .join("");
+      }
+    }
   }
 
   function syncDraftFromDom() {
@@ -3100,6 +3407,27 @@
         el.value.trim();
     });
 
+    document.querySelectorAll(".plex-name-in").forEach((el) => {
+      state.draftConfig.plex_instances[Number(el.dataset.idx)].name = el.value.trim();
+    });
+    document.querySelectorAll(".plex-url-in").forEach((el) => {
+      state.draftConfig.plex_instances[Number(el.dataset.idx)].url = el.value.trim();
+    });
+    document.querySelectorAll(".plex-token-in").forEach((el) => {
+      state.draftConfig.plex_instances[Number(el.dataset.idx)].token = el.value.trim();
+    });
+    document.querySelectorAll(".plex-enabled-in").forEach((el) => {
+      state.draftConfig.plex_instances[Number(el.dataset.idx)].enabled = el.checked;
+    });
+    document.querySelectorAll(".plex-map-remote-in").forEach((el) => {
+      state.draftConfig.plex_instances[Number(el.dataset.idx)].path_mappings[Number(el.dataset.midx)].remote_prefix =
+        el.value.trim();
+    });
+    document.querySelectorAll(".plex-map-local-in").forEach((el) => {
+      state.draftConfig.plex_instances[Number(el.dataset.idx)].path_mappings[Number(el.dataset.midx)].local_prefix =
+        el.value.trim();
+    });
+
     const extsRaw = $("ignoreExtInput").value;
     state.draftConfig.ignore_extensions = extsRaw
       .split(",")
@@ -3116,6 +3444,7 @@
       folders: cfg.folders || [],
       qbit_instances: cfg.qbit_instances || [],
       arr_instances: cfg.arr_instances || [],
+      plex_instances: cfg.plex_instances || [],
       ignore_extensions: cfg.ignore_extensions || [],
       min_size_bytes: Number(cfg.min_size_bytes || 0),
     });
@@ -3137,6 +3466,12 @@
         .map((a) => ({
           ...a,
           path_mappings: (a.path_mappings || []).filter((m) => m.remote_prefix && m.local_prefix),
+        })),
+      plex_instances: (state.draftConfig.plex_instances || [])
+        .filter((p) => p.name && p.url)
+        .map((p) => ({
+          ...p,
+          path_mappings: (p.path_mappings || []).filter((m) => m.remote_prefix && m.local_prefix),
         })),
     };
 
@@ -3269,6 +3604,13 @@
       state.page = 1;
       renderTable();
     });
+    if ($("plexFilter")) {
+      $("plexFilter").addEventListener("change", (e) => {
+        state.plexFilter = e.target.value;
+        state.page = 1;
+        renderTable();
+      });
+    }
     $("folderFilter").addEventListener("change", (e) => {
       state.folderFilter = e.target.value;
       state.page = 1;
@@ -3582,6 +3924,22 @@
       renderSettingsEditors();
     });
 
+    if ($("addPlexBtn")) {
+      $("addPlexBtn").addEventListener("click", () => {
+        syncDraftFromDom();
+        state.draftConfig.plex_instances = state.draftConfig.plex_instances || [];
+        state.draftConfig.plex_instances.push({
+          id: randomId("plex"),
+          name: `Plex ${state.draftConfig.plex_instances.length + 1}`,
+          url: "http://192.168.1.100:32400",
+          token: "",
+          enabled: true,
+          path_mappings: [],
+        });
+        renderSettingsEditors();
+      });
+    }
+
     $("foldersEditorList").addEventListener("click", (e) => {
       const btn = e.target.closest("button");
       if (!btn) return;
@@ -3672,6 +4030,47 @@
         }
       }
     });
+
+    if ($("plexEditorList")) {
+      $("plexEditorList").addEventListener("click", async (e) => {
+        const btn = e.target.closest("button");
+        if (!btn) return;
+        syncDraftFromDom();
+        const idx = Number(btn.dataset.idx);
+
+        if (btn.classList.contains("remove-plex-btn")) {
+          state.draftConfig.plex_instances.splice(idx, 1);
+          renderSettingsEditors();
+        } else if (btn.classList.contains("add-plex-mapping-btn")) {
+          state.draftConfig.plex_instances[idx].path_mappings.push({ remote_prefix: "", local_prefix: "" });
+          renderSettingsEditors();
+        } else if (btn.classList.contains("remove-plex-map-btn")) {
+          const mIdx = Number(btn.dataset.midx);
+          state.draftConfig.plex_instances[idx].path_mappings.splice(mIdx, 1);
+          renderSettingsEditors();
+        } else if (btn.classList.contains("test-plex-btn")) {
+          const statusEl = $(`plexTestStatus-${idx}`);
+          statusEl.className = "test-status";
+          statusEl.textContent = "Testing...";
+          try {
+            const res = await apiFetch("/api/plex/test", {
+              method: "POST",
+              body: JSON.stringify(state.draftConfig.plex_instances[idx]),
+            });
+            if (res.ok) {
+              statusEl.className = "test-status test-ok";
+              statusEl.textContent = `Connected (${res.server_name || "Plex"} v${res.version || "?"}, ${res.library_count || 0} libs, ${res.item_count || 0} items)`;
+            } else {
+              statusEl.className = "test-status test-fail";
+              statusEl.textContent = `Failed: ${res.error || "Unknown error"}`;
+            }
+          } catch (err) {
+            statusEl.className = "test-status test-fail";
+            statusEl.textContent = `Failed: ${err.message}`;
+          }
+        }
+      });
+    }
 
     $("closePickerBtn").addEventListener("click", () => ($("folderPickerModal").hidden = true));
     $("cancelPickerBtn").addEventListener("click", () => ($("folderPickerModal").hidden = true));

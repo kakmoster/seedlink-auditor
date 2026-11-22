@@ -45,12 +45,22 @@ type ArrInstanceConfig struct {
 	PathMappings []PathMapping `json:"path_mappings"`
 }
 
+type PlexInstanceConfig struct {
+	ID           string        `json:"id"`
+	Name         string        `json:"name"`
+	URL          string        `json:"url"`
+	Token        string        `json:"token"`
+	Enabled      bool          `json:"enabled"`
+	PathMappings []PathMapping `json:"path_mappings"`
+}
+
 type AppSettings struct {
 	ReadOnlyMode      bool                 `json:"read_only_mode"`
 	ShowMediaMetadata bool                 `json:"show_media_metadata"`
 	Folders           []FolderConfig       `json:"folders"`
 	QbitInstances     []QbitInstanceConfig `json:"qbit_instances"`
 	ArrInstances      []ArrInstanceConfig  `json:"arr_instances"`
+	PlexInstances     []PlexInstanceConfig `json:"plex_instances"`
 	IgnoreExtensions  []string             `json:"ignore_extensions"`
 	MinSizeBytes      int64                `json:"min_size_bytes"`
 }
@@ -76,6 +86,7 @@ func defaultSettings() AppSettings {
 		Folders:           []FolderConfig{},
 		QbitInstances:     []QbitInstanceConfig{},
 		ArrInstances:      []ArrInstanceConfig{},
+		PlexInstances:     []PlexInstanceConfig{},
 		IgnoreExtensions:  []string{},
 		MinSizeBytes:      0,
 	}
@@ -101,6 +112,7 @@ func normalizeSettings(in AppSettings) (AppSettings, error) {
 		Folders:           make([]FolderConfig, 0, len(in.Folders)),
 		QbitInstances:     make([]QbitInstanceConfig, 0, len(in.QbitInstances)),
 		ArrInstances:      make([]ArrInstanceConfig, 0, len(in.ArrInstances)),
+		PlexInstances:     make([]PlexInstanceConfig, 0, len(in.PlexInstances)),
 		IgnoreExtensions:  make([]string, 0, len(in.IgnoreExtensions)),
 		MinSizeBytes:      in.MinSizeBytes,
 	}
@@ -182,6 +194,26 @@ func normalizeSettings(in AppSettings) (AppSettings, error) {
 		})
 	}
 
+	for _, p := range in.PlexInstances {
+		name := strings.TrimSpace(p.Name)
+		u := strings.TrimRight(strings.TrimSpace(p.URL), "/")
+		if name == "" || u == "" {
+			return AppSettings{}, errors.New("each Plex instance requires a non-empty name and url")
+		}
+		id := strings.TrimSpace(p.ID)
+		if id == "" {
+			id = randomID()
+		}
+		out.PlexInstances = append(out.PlexInstances, PlexInstanceConfig{
+			ID:           id,
+			Name:         name,
+			URL:          u,
+			Token:        strings.TrimSpace(p.Token),
+			Enabled:      p.Enabled,
+			PathMappings: normalizePathMappings(p.PathMappings),
+		})
+	}
+
 	seenExt := make(map[string]struct{}, len(in.IgnoreExtensions))
 	for _, raw := range in.IgnoreExtensions {
 		ext := strings.ToLower(strings.TrimSpace(raw))
@@ -208,6 +240,7 @@ func cloneSettings(s AppSettings) AppSettings {
 		Folders:           make([]FolderConfig, len(s.Folders)),
 		QbitInstances:     make([]QbitInstanceConfig, len(s.QbitInstances)),
 		ArrInstances:      make([]ArrInstanceConfig, len(s.ArrInstances)),
+		PlexInstances:     make([]PlexInstanceConfig, len(s.PlexInstances)),
 		IgnoreExtensions:  make([]string, len(s.IgnoreExtensions)),
 		MinSizeBytes:      s.MinSizeBytes,
 	}
@@ -224,6 +257,12 @@ func cloneSettings(s AppSettings) AppSettings {
 		ac.PathMappings = make([]PathMapping, len(a.PathMappings))
 		copy(ac.PathMappings, a.PathMappings)
 		out.ArrInstances[i] = ac
+	}
+	for i, p := range s.PlexInstances {
+		pc := p
+		pc.PathMappings = make([]PathMapping, len(p.PathMappings))
+		copy(pc.PathMappings, p.PathMappings)
+		out.PlexInstances[i] = pc
 	}
 	return out
 }
